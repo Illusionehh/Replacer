@@ -2,18 +2,22 @@
 
 <#
 .SYNOPSIS
-    USN Journal Replace Detector
+    USN Replace Detector v2
 
 .DESCRIPTION
-    Analizza il Windows USN Journal alla ricerca di sequenze di eventi
-    filesystem potenzialmente compatibili con attività di file replacement.
+    Analizza il Windows NTFS USN Change Journal alla ricerca
+    di combinazioni di USN_REASON flag compatibili con le
+    sequenze configurate nel detector.
 
-    Il tool è destinato a finalità di digital forensics e detection.
-    Un match NON costituisce, da solo, prova conclusiva di file replacement,
-    cheating o altra attività illecita.
+    Il tool è destinato a finalità di detection e digital forensics.
+    Un match è un INDICATORE e non costituisce, da solo,
+    una prova conclusiva di file replacement.
 
 .AUTHOR
     illusionehh
+
+.VERSION
+    2.0
 #>
 
 param(
@@ -22,17 +26,13 @@ param(
     [string]$Drive = "C:",
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputCsv = ".\usn_replace_findings.csv",
-
-    [Parameter(Mandatory = $false)]
-    [ValidateRange(1, 3600)]
-    [int]$MaxGapSeconds = 30
+    [string]$OutputCsv = ".\usn_replace_findings.csv"
 )
 
 $ErrorActionPreference = "Stop"
 
 # ============================================================
-# Banner
+# BANNER
 # ============================================================
 
 $Banner = @'
@@ -56,447 +56,601 @@ Write-Host $Banner -ForegroundColor Cyan
 Write-Host ""
 
 # ============================================================
-# Prerequisite checks
+# USN REASON FLAGS
+# Microsoft documented values
 # ============================================================
 
-if (-not (Get-Command fsutil.exe -ErrorAction SilentlyContinue)) {
-    Write-Error "fsutil.exe non è disponibile."
-    exit 1
+$USN = [ordered]@{
+    DATA_OVERWRITE      = [uint32]0x00000001
+    DATA_EXTEND         = [uint32]0x00000002
+    DATA_TRUNCATION     = [uint32]0x00000004
+
+    NAMED_DATA_OVERWRITE  = [uint32]0x00000010
+    NAMED_DATA_EXTEND     = [uint32]0x00000020
+    NAMED_DATA_TRUNCATION = [uint32]0x00000040
+
+    FILE_CREATE         = [uint32]0x00000100
+    FILE_DELETE         = [uint32]0x00000200
+
+    SECURITY_CHANGE     = [uint32]0x00000800
+
+    RENAME_OLD_NAME     = [uint32]0x00001000
+    RENAME_NEW_NAME     = [uint32]0x00002000
+
+    BASIC_INFO_CHANGE   = [uint32]0x00008000
+
+    CLOSE               = [uint32]0x80000000
 }
+
+# ============================================================
+# HELPER: Reason -> UInt32
+# ============================================================
+
+function Convert-ToReasonUInt32 {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = ([string]$Value).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    try {
+
+        if ($text -match '^0x[0-9a-fA-F]+$') {
+
+            return [Convert]::ToUInt32(
+                $text.Substring(2),
+                16
+            )
+        }
+
+        return [Convert]::ToUInt32($text)
+    }
+    catch {
+        return $null
+    }
+}
+
+# ============================================================
+# HELPER: verifica che TUTTI i flag siano presenti
+# ============================================================
+
+function Test-ReasonMask {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        [uint32]$Reason,
+
+        [Parameter(Mandatory = $true)]
+        [uint32[]]$RequiredFlags
+    )
+
+    $required = [uint32]0
+
+    foreach ($flag in $RequiredFlags) {
+        $required = $required -bor $flag
+    }
+
+    return (($Reason -band $required) -eq $required)
+}
+
+# ============================================================
+# HELPER: restituisce i flag leggibili
+# ============================================================
+
+function Get-ReasonNames {
+
+    param(
+        [Parameter(Mandatory = $true)]
+        [uint32]$Reason
+    )
+
+    $names = New-Object System.Collections.Generic.List[string]
+
+    foreach ($entry in $USN.GetEnumerator()) {
+
+        $flag = [uint32]$entry.Value
+
+        if (($Reason -band $flag) -eq $flag) {
+            $names.Add($entry.Key)
+        }
+    }
+
+    return $names.ToArray()
+}
+
+# ============================================================
+# PATTERN
+#
+# Ogni elemento rappresenta un SINGOLO USN record.
+# All'interno del record, tutti i flag indicati devono essere
+# presenti contemporaneamente.
+# ============================================================
+
+$Patterns = @(
+
+    # --------------------------------------------------------
+    # EXPLORER
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "Explorer"
+        Variant   = "File Delete + Close"
+        Required  = @(
+            $USN.FILE_DELETE,
+            $USN.CLOSE
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Explorer"
+        Variant   = "Rename Old Name"
+        Required  = @(
+            $USN.RENAME_OLD_NAME
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Explorer"
+        Variant   = "Rename New Name"
+        Required  = @(
+            $USN.RENAME_NEW_NAME
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Explorer"
+        Variant   = "Rename New Name + Close"
+        Required  = @(
+            $USN.RENAME_NEW_NAME,
+            $USN.CLOSE
+        )
+    },
+
+    # --------------------------------------------------------
+    # TYPE 1
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "Type 1"
+        Variant   = "Data Extend + Data Truncation"
+        Required  = @(
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Type 1"
+        Variant   = "Data Extend + Data Truncation + Close"
+        Required  = @(
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.CLOSE
+        )
+    },
+
+    # --------------------------------------------------------
+    # TYPE 2
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "Type 2"
+        Variant   = "Data Truncation"
+        Required  = @(
+            $USN.DATA_TRUNCATION
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Type 2"
+        Variant   = "Data Extend + Data Truncation"
+        Required  = @(
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION
+        )
+    },
+
+    # --------------------------------------------------------
+    # COPY 1
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "Copy 1"
+        Variant   = "Data Truncation + Security Change"
+        Required  = @(
+            $USN.DATA_TRUNCATION,
+            $USN.SECURITY_CHANGE
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 1"
+        Variant   = "Data Extend + Data Truncation + Security Change"
+        Required  = @(
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.SECURITY_CHANGE
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 1"
+        Variant   = "Overwrite + Extend + Truncation + Security"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.SECURITY_CHANGE
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 1"
+        Variant   = "Overwrite + Extend + Truncation + Security + BasicInfo"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.SECURITY_CHANGE,
+            $USN.BASIC_INFO_CHANGE
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 1"
+        Variant   = "Overwrite + Extend + Truncation + Security + BasicInfo + Close"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.SECURITY_CHANGE,
+            $USN.BASIC_INFO_CHANGE,
+            $USN.CLOSE
+        )
+    },
+
+    # --------------------------------------------------------
+    # COPY 2
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "Copy 2"
+        Variant   = "Data Truncation"
+        Required  = @(
+            $USN.DATA_TRUNCATION
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 2"
+        Variant   = "Data Extend + Data Truncation"
+        Required  = @(
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 2"
+        Variant   = "Overwrite + Extend + Truncation"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 2"
+        Variant   = "Overwrite + Extend + Truncation + BasicInfo"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.BASIC_INFO_CHANGE
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "Copy 2"
+        Variant   = "Overwrite + Extend + Truncation + BasicInfo + Close"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.DATA_TRUNCATION,
+            $USN.BASIC_INFO_CHANGE,
+            $USN.CLOSE
+        )
+    },
+
+    # --------------------------------------------------------
+    # HEX 1
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "HEX 1"
+        Variant   = "Data Extend"
+        Required  = @(
+            $USN.DATA_EXTEND
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "HEX 1"
+        Variant   = "Data Overwrite + Data Extend"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "HEX 1"
+        Variant   = "Data Overwrite + Data Extend + Close"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.CLOSE
+        )
+    },
+
+    # --------------------------------------------------------
+    # HEX 2
+    # --------------------------------------------------------
+
+    [PSCustomObject]@{
+        Technique = "HEX 2"
+        Variant   = "Data Overwrite + Data Extend"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND
+        )
+    },
+
+    [PSCustomObject]@{
+        Technique = "HEX 2"
+        Variant   = "Data Overwrite + Data Extend + Close"
+        Required  = @(
+            $USN.DATA_OVERWRITE,
+            $USN.DATA_EXTEND,
+            $USN.CLOSE
+        )
+    }
+)
+
+# ============================================================
+# CHECK DRIVE
+# ============================================================
 
 if (-not (Test-Path "$Drive\")) {
-    Write-Error "L'unità $Drive non è disponibile."
+    Write-Host "[!] Drive $Drive non trovata." -ForegroundColor Red
     exit 1
 }
 
-Write-Host "[*] Drive              : $Drive" -ForegroundColor Gray
-Write-Host "[*] Max event gap      : $MaxGapSeconds seconds" -ForegroundColor Gray
-Write-Host "[*] Output             : $OutputCsv" -ForegroundColor Gray
+if (-not (Get-Command fsutil.exe -ErrorAction SilentlyContinue)) {
+    Write-Host "[!] fsutil.exe non disponibile." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[*] Drive   : $Drive" -ForegroundColor Gray
+Write-Host "[*] Output  : $OutputCsv" -ForegroundColor Gray
 Write-Host ""
 
 # ============================================================
-# USN Journal
+# READ JOURNAL
 # ============================================================
 
 Write-Host "[*] Lettura USN Journal..." -ForegroundColor Cyan
+Write-Host "[*] Questa operazione può richiedere tempo." -ForegroundColor DarkGray
+Write-Host ""
 
-try {
-    $raw = @(fsutil.exe usn readjournal $Drive csv 2>$null)
-}
-catch {
-    Write-Error "Errore durante la lettura dell'USN Journal: $($_.Exception.Message)"
-    exit 1
-}
+$raw = @(
+    & fsutil.exe usn readjournal $Drive csv 2>&1
+)
 
 if ($raw.Count -eq 0) {
-    Write-Error "Nessun dato restituito dall'USN Journal."
+    Write-Host "[!] Nessun dato restituito da fsutil." -ForegroundColor Red
     exit 1
 }
 
 Write-Host "[+] Righe ricevute: $($raw.Count)" -ForegroundColor Green
 
 # ============================================================
-# CSV parsing
+# FIND CSV HEADER
 # ============================================================
 
-$events = New-Object System.Collections.Generic.List[object]
+$headerIndex = -1
 
-foreach ($line in $raw) {
+for ($i = 0; $i -lt $raw.Count; $i++) {
 
-    if ([string]::IsNullOrWhiteSpace($line)) {
-        continue
-    }
+    $line = [string]$raw[$i]
 
-    try {
-        $record = $line | ConvertFrom-Csv
-
-        if (-not $record.FileName) {
-            continue
-        }
-
-        $events.Add(
-            [PSCustomObject]@{
-                RecordNumber              = $record.RecordNumber
-                MajorVersion              = $record.MajorVersion
-                MinorVersion              = $record.MinorVersion
-                FileReferenceNumber       = $record.FileReferenceNumber
-                ParentFileReferenceNumber = $record.ParentFileReferenceNumber
-                USN                       = $record.USN
-                TimeStamp                 = $record.TimeStamp
-                Reason                    = $record.Reason
-                SourceInfo                = $record.SourceInfo
-                SecurityId                = $record.SecurityId
-                FileAttributes            = $record.FileAttributes
-                FileName                  = $record.FileName
-            }
-        )
-    }
-    catch {
-        continue
+    if (
+        $line -match '^(?i)Usn,' -or
+        $line -match '^(?i)"?Usn"?,' -or
+        $line -match '^(?i)MajorVersion,'
+    ) {
+        $headerIndex = $i
+        break
     }
 }
 
-if ($events.Count -eq 0) {
-    Write-Error "Non è stato possibile interpretare alcun record."
+if ($headerIndex -lt 0) {
+
+    Write-Host ""
+    Write-Host "[!] Header CSV non trovato." -ForegroundColor Red
+    Write-Host ""
+    Write-Host "Prime righe restituite da fsutil:" -ForegroundColor Yellow
+
+    $raw |
+        Select-Object -First 10 |
+        ForEach-Object {
+            Write-Host $_
+        }
+
     exit 1
 }
 
-Write-Host "[+] Record interpretati: $($events.Count)" -ForegroundColor Green
+Write-Host "[+] CSV header trovato alla riga: $headerIndex" -ForegroundColor Green
 
 # ============================================================
-# Reason normalization
+# PARSE CSV
 # ============================================================
 
-function Get-NormalizedReasons {
+$csvText = (
+    $raw[$headerIndex..($raw.Count - 1)] -join "`r`n"
+)
 
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Reason
-    )
-
-    $result = New-Object System.Collections.Generic.List[string]
-
-    if ([string]::IsNullOrWhiteSpace($Reason)) {
-        return $result.ToArray()
-    }
-
-    $r = $Reason.ToLowerInvariant()
-
-    if ($r -match "file[_ ]?delete") {
-        $result.Add("File Delete")
-    }
-
-    if ($r -match "rename[_ ]?old") {
-        $result.Add("Rename: old name")
-    }
-
-    if ($r -match "rename[_ ]?new") {
-        $result.Add("Rename: new name")
-    }
-
-    if ($r -match "data[_ ]?extend") {
-        $result.Add("Data Extend")
-    }
-
-    if ($r -match "data[_ ]?truncation") {
-        $result.Add("Data Truncation")
-    }
-
-    if ($r -match "data[_ ]?overwrite") {
-        $result.Add("Data Overwrite")
-    }
-
-    if ($r -match "security[_ ]?change") {
-        $result.Add("Security Change")
-    }
-
-    if ($r -match "basic[_ ]?info") {
-        $result.Add("Basic Info Change")
-    }
-
-    if ($r -match "\bclose\b") {
-        $result.Add("Close")
-    }
-
-    return $result.ToArray()
-}
-
-# ============================================================
-# Normalize events
-# ============================================================
-
-$normalized = New-Object System.Collections.Generic.List[object]
-
-foreach ($event in $events) {
-
-    $reasons = Get-NormalizedReasons -Reason $event.Reason
-
-    foreach ($reason in $reasons) {
-
-        $normalized.Add(
-            [PSCustomObject]@{
-                FileReference       = $event.FileReferenceNumber
-                ParentReference     = $event.ParentFileReferenceNumber
-                FileName            = $event.FileName
-                TimeStamp           = $event.TimeStamp
-                Reason              = $reason
-                USN                 = $event.USN
-                OriginalReason      = $event.Reason
-            }
-        )
-    }
-}
-
-Write-Host "[+] Eventi normalizzati: $($normalized.Count)" -ForegroundColor Green
-
-# ============================================================
-# Detection patterns
-# ============================================================
-
-$Patterns = [ordered]@{
-
-    "Explorer" = @(
-        @("File Delete", "Close"),
-        @("Rename: old name", "Rename: new name"),
-        @("Rename: new name", "Close")
-    )
-
-    "Type 1" = @(
-        @("Data Extend", "Data Truncation"),
-        @("Data Extend", "Data Truncation", "Close")
-    )
-
-    "Type 2" = @(
-        @("Data Truncation"),
-        @("Data Extend", "Data Truncation")
-    )
-
-    "Copy 1" = @(
-        @("Data Truncation", "Security Change"),
-        @("Data Extend", "Data Truncation", "Security Change"),
-        @(
-            "Data Overwrite",
-            "Data Extend",
-            "Data Truncation",
-            "Security Change"
-        ),
-        @(
-            "Data Overwrite",
-            "Data Extend",
-            "Data Truncation",
-            "Security Change",
-            "Basic Info Change"
-        ),
-        @(
-            "Data Overwrite",
-            "Data Extend",
-            "Data Truncation",
-            "Security Change",
-            "Basic Info Change",
-            "Close"
-        )
-    )
-
-    "Copy 2" = @(
-        @("Data Truncation"),
-        @("Data Extend", "Data Truncation"),
-        @(
-            "Data Overwrite",
-            "Data Extend",
-            "Data Truncation"
-        ),
-        @(
-            "Data Overwrite",
-            "Data Extend",
-            "Data Truncation",
-            "Basic Info Change"
-        ),
-        @(
-            "Data Overwrite",
-            "Data Extend",
-            "Data Truncation",
-            "Basic Info Change",
-            "Close"
-        )
-    )
-
-    "HEX 1" = @(
-        @("Data Extend"),
-        @("Data Overwrite", "Data Extend"),
-        @("Data Overwrite", "Data Extend", "Close")
-    )
-
-    "HEX 2" = @(
-        @("Data Overwrite", "Data Extend"),
-        @("Data Overwrite", "Data Extend", "Close")
+try {
+    $records = @(
+        $csvText | ConvertFrom-Csv
     )
 }
+catch {
 
-# ============================================================
-# Timestamp helper
-# ============================================================
-
-function Convert-ToDateTime {
-
-    param(
-        [object]$Value
-    )
-
-    try {
-        return [DateTime]::Parse(
-            [string]$Value,
-            [Globalization.CultureInfo]::InvariantCulture
-        )
-    }
-    catch {
-        return $null
-    }
+    Write-Host "[!] Errore durante il parsing CSV:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
 }
 
+if ($records.Count -eq 0) {
+    Write-Host "[!] Nessun record CSV interpretato." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[+] Record USN interpretati: $($records.Count)" -ForegroundColor Green
+Write-Host ""
+
 # ============================================================
-# Pattern matcher
+# DETECTION
 # ============================================================
 
-function Find-Pattern {
+$findings = New-Object System.Collections.Generic.List[object]
 
-    param(
-        [Parameter(Mandatory = $true)]
-        [array]$Events,
+$processed = 0
+$matches   = 0
 
-        [Parameter(Mandatory = $true)]
-        [array]$Pattern,
+Write-Host "[*] Analisi Reason bitmask..." -ForegroundColor Cyan
 
-        [Parameter(Mandatory = $true)]
-        [int]$MaxGap
-    )
+foreach ($record in $records) {
 
-    if ($Events.Count -lt $Pattern.Count) {
-        return $null
+    $processed++
+
+    # Il nome della colonna può essere "Reason".
+    $reasonValue = $record.Reason
+
+    $reason = Convert-ToReasonUInt32 $reasonValue
+
+    if ($null -eq $reason) {
+        continue
     }
 
-    for ($i = 0; $i -le ($Events.Count - $Pattern.Count); $i++) {
+    foreach ($pattern in $Patterns) {
 
-        $matched = $true
+        if (
+            Test-ReasonMask `
+                -Reason $reason `
+                -RequiredFlags $pattern.Required
+        ) {
 
-        for ($j = 0; $j -lt $Pattern.Count; $j++) {
+            $matches++
 
-            $current = $Events[$i + $j]
+            $reasonNames = Get-ReasonNames $reason
 
-            if ($current.Reason -ne $Pattern[$j]) {
-                $matched = $false
-                break
-            }
-
-            if ($j -gt 0) {
-
-                $previous = $Events[$i + $j - 1]
-
-                $previousTime = Convert-ToDateTime $previous.TimeStamp
-                $currentTime  = Convert-ToDateTime $current.TimeStamp
-
-                if ($null -ne $previousTime -and $null -ne $currentTime) {
-
-                    $gap = ($currentTime - $previousTime).TotalSeconds
-
-                    if ($gap -lt 0 -or $gap -gt $MaxGap) {
-                        $matched = $false
-                        break
-                    }
+            $findings.Add(
+                [PSCustomObject]@{
+                    TimeStamp       = $record.TimeStamp
+                    Technique       = $pattern.Technique
+                    Variant         = $pattern.Variant
+                    FileName        = $record.FileName
+                    FileReference   = $record.FileReferenceNumber
+                    ParentReference = $record.ParentFileReferenceNumber
+                    USN             = $record.Usn
+                    ReasonDecimal   = $reason
+                    ReasonHex       = ("0x{0:X8}" -f $reason)
+                    ReasonsPresent  = ($reasonNames -join " | ")
+                    RequiredFlags   = (
+                        $pattern.Required |
+                        ForEach-Object {
+                            "0x{0:X8}" -f $_
+                        }
+                    ) -join " | "
+                    Indicator       = "MATCH"
                 }
-            }
-        }
-
-        if ($matched) {
-            return @(
-                $Events[$i..($i + $Pattern.Count - 1)]
             )
         }
     }
 
-    return $null
-}
-
-# ============================================================
-# Detection
-# ============================================================
-
-Write-Host ""
-Write-Host "[*] Analisi delle sequenze..." -ForegroundColor Cyan
-
-$findings = New-Object System.Collections.Generic.List[object]
-
-$groups = $normalized |
-    Group-Object FileReference
-
-foreach ($group in $groups) {
-
-    $fileEvents = @(
-        $group.Group |
-        Sort-Object {
-            $date = Convert-ToDateTime $_.TimeStamp
-
-            if ($null -eq $date) {
-                [DateTime]::MinValue
-            }
-            else {
-                $date
-            }
-        }
-    )
-
-    foreach ($technique in $Patterns.Keys) {
-
-        foreach ($pattern in $Patterns[$technique]) {
-
-            $hit = Find-Pattern `
-                -Events $fileEvents `
-                -Pattern $pattern `
-                -MaxGap $MaxGapSeconds
-
-            if ($null -ne $hit) {
-
-                $findings.Add(
-                    [PSCustomObject]@{
-                        DetectionTime   = $hit[0].TimeStamp
-                        Technique       = $technique
-                        FileName        = $hit[0].FileName
-                        FileReference   = $hit[0].FileReference
-                        ParentReference = $hit[0].ParentReference
-                        Sequence        = ($hit.Reason -join " -> ")
-                        EventCount      = $hit.Count
-                        USNs            = ($hit.USN -join ", ")
-                        Confidence      = "Indicator"
-                    }
-                )
-
-                break
-            }
-        }
+    if (($processed % 50000) -eq 0) {
+        Write-Host "[*] Processati: $processed / $($records.Count)" -ForegroundColor DarkGray
     }
 }
 
 # ============================================================
-# Results
+# RESULTS
 # ============================================================
 
+Write-Host ""
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host "             ANALYSIS COMPLETE" -ForegroundColor Cyan
+Write-Host "============================================" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "Record analizzati : $processed" -ForegroundColor Gray
+Write-Host "Match trovati     : $matches" -ForegroundColor Gray
 Write-Host ""
 
 if ($findings.Count -eq 0) {
 
-    Write-Host "============================================" -ForegroundColor Green
-    Write-Host "  NO MATCHES FOUND" -ForegroundColor Green
-    Write-Host "============================================" -ForegroundColor Green
+    Write-Host "NO MATCHES FOUND" -ForegroundColor Green
     Write-Host ""
-    Write-Host "Nessuna delle sequenze configurate è stata rilevata."
 
 }
 else {
 
-    Write-Host "============================================" -ForegroundColor Yellow
-    Write-Host "  USN REPLACE INDICATORS DETECTED"
-    Write-Host "============================================" -ForegroundColor Yellow
+    Write-Host "INDICATORS DETECTED" -ForegroundColor Yellow
     Write-Host ""
 
     $findings |
-        Sort-Object DetectionTime |
+        Sort-Object TimeStamp |
         Format-Table `
-            DetectionTime,
+            TimeStamp,
             Technique,
+            Variant,
             FileName,
-            Sequence `
+            ReasonHex `
             -Wrap `
             -AutoSize
 
-    $findings |
-        Export-Csv `
-            -Path $OutputCsv `
-            -NoTypeInformation `
-            -Encoding UTF8
+    try {
 
-    Write-Host ""
-    Write-Host "[!] Indicators found : $($findings.Count)" -ForegroundColor Yellow
-    Write-Host "[+] CSV report       : $OutputCsv" -ForegroundColor Cyan
+        $findings |
+            Export-Csv `
+                -Path $OutputCsv `
+                -NoTypeInformation `
+                -Encoding UTF8
+
+        Write-Host ""
+        Write-Host "[+] Report CSV salvato in:" -ForegroundColor Green
+        Write-Host "    $((Resolve-Path $OutputCsv).Path)" -ForegroundColor Cyan
+    }
+    catch {
+
+        Write-Host ""
+        Write-Host "[!] Impossibile creare il CSV: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }
 
 Write-Host ""
-Write-Host "Analysis completed." -ForegroundColor Cyan
+Write-Host "Nota: un MATCH è un indicatore e richiede verifica forense." -ForegroundColor DarkYellow
+Write-Host ""
