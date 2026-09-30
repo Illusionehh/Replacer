@@ -61,25 +61,25 @@ Write-Host ""
 # ============================================================
 
 $USN = [ordered]@{
-    DATA_OVERWRITE      = [uint32]0x00000001
-    DATA_EXTEND         = [uint32]0x00000002
-    DATA_TRUNCATION     = [uint32]0x00000004
+    DATA_OVERWRITE        = [int64]0x00000001
+    DATA_EXTEND           = [int64]0x00000002
+    DATA_TRUNCATION       = [int64]0x00000004
 
-    NAMED_DATA_OVERWRITE  = [uint32]0x00000010
-    NAMED_DATA_EXTEND     = [uint32]0x00000020
-    NAMED_DATA_TRUNCATION = [uint32]0x00000040
+    NAMED_DATA_OVERWRITE  = [int64]0x00000010
+    NAMED_DATA_EXTEND     = [int64]0x00000020
+    NAMED_DATA_TRUNCATION = [int64]0x00000040
 
-    FILE_CREATE         = [uint32]0x00000100
-    FILE_DELETE         = [uint32]0x00000200
+    FILE_CREATE           = [int64]0x00000100
+    FILE_DELETE           = [int64]0x00000200
 
-    SECURITY_CHANGE     = [uint32]0x00000800
+    SECURITY_CHANGE       = [int64]0x00000800
 
-    RENAME_OLD_NAME     = [uint32]0x00001000
-    RENAME_NEW_NAME     = [uint32]0x00002000
+    RENAME_OLD_NAME       = [int64]0x00001000
+    RENAME_NEW_NAME       = [int64]0x00002000
 
-    BASIC_INFO_CHANGE   = [uint32]0x00008000
+    BASIC_INFO_CHANGE     = [int64]0x00008000
 
-    CLOSE               = [uint32]0x80000000
+    CLOSE                 = [int64]0x80000000
 }
 
 # ============================================================
