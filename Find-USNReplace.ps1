@@ -105,15 +105,30 @@ function Convert-ToReasonUInt32 {
 
     try {
 
+        # Valore esadecimale, es. 0x80000000
         if ($text -match '^0x[0-9a-fA-F]+$') {
 
-            return [Convert]::ToUInt32(
-                $text.Substring(2),
-                16
+            $hex = $text.Substring(2)
+
+            return [BitConverter]::ToUInt32(
+                [BitConverter]::GetBytes(
+                    [uint32]([Convert]::ToUInt64($hex, 16))
+                ),
+                0
             )
         }
 
-        return [Convert]::ToUInt32($text)
+        # fsutil può restituire i valori >= 0x80000000
+        # come Int32 negativi, ad esempio:
+        # -2147483648 = 0x80000000
+        $signed = [int64]$text
+
+        if ($signed -lt 0) {
+            $unsigned64 = $signed + 4294967296
+            return [uint32]$unsigned64
+        }
+
+        return [uint32]$signed
     }
     catch {
         return $null
