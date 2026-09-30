@@ -59,34 +59,30 @@ Write-Host ""
 # USN REASON FLAGS
 # Microsoft documented values
 # ============================================================
-
 $USN = [ordered]@{
-    DATA_OVERWRITE        = [int64]0x00000001
-    DATA_EXTEND           = [int64]0x00000002
-    DATA_TRUNCATION       = [int64]0x00000004
+    DATA_OVERWRITE        = [int64]1
+    DATA_EXTEND           = [int64]2
+    DATA_TRUNCATION       = [int64]4
 
-    NAMED_DATA_OVERWRITE  = [int64]0x00000010
-    NAMED_DATA_EXTEND     = [int64]0x00000020
-    NAMED_DATA_TRUNCATION = [int64]0x00000040
+    NAMED_DATA_OVERWRITE  = [int64]16
+    NAMED_DATA_EXTEND     = [int64]32
+    NAMED_DATA_TRUNCATION = [int64]64
 
-    FILE_CREATE           = [int64]0x00000100
-    FILE_DELETE           = [int64]0x00000200
+    FILE_CREATE           = [int64]256
+    FILE_DELETE           = [int64]512
 
-    SECURITY_CHANGE       = [int64]0x00000800
+    SECURITY_CHANGE       = [int64]2048
 
-    RENAME_OLD_NAME       = [int64]0x00001000
-    RENAME_NEW_NAME       = [int64]0x00002000
+    RENAME_OLD_NAME       = [int64]4096
+    RENAME_NEW_NAME       = [int64]8192
 
-    BASIC_INFO_CHANGE     = [int64]0x00008000
+    BASIC_INFO_CHANGE     = [int64]32768
 
-    CLOSE                 = [int64]0x80000000
+    # 0x80000000 = 2147483648
+    CLOSE                 = [int64]2147483648
 }
 
-# ============================================================
-# HELPER: Reason -> UInt32
-# ============================================================
-
-function Convert-ToReasonUInt32 {
+function Convert-ToReasonInt64 {
 
     param(
         [Parameter(Mandatory = $true)]
@@ -104,52 +100,38 @@ function Convert-ToReasonUInt32 {
     }
 
     try {
-
-        # Valore esadecimale, es. 0x80000000
         if ($text -match '^0x[0-9a-fA-F]+$') {
-
-            $hex = $text.Substring(2)
-
-            return [BitConverter]::ToUInt32(
-                [BitConverter]::GetBytes(
-                    [uint32]([Convert]::ToUInt64($hex, 16))
-                ),
-                0
-            )
+            return [int64]([Convert]::ToInt64(
+                $text.Substring(2),
+                16
+            ))
         }
 
-        # fsutil può restituire i valori >= 0x80000000
-        # come Int32 negativi, ad esempio:
-        # -2147483648 = 0x80000000
-        $signed = [int64]$text
+        $value = [int64]$text
 
-        if ($signed -lt 0) {
-            $unsigned64 = $signed + 4294967296
-            return [uint32]$unsigned64
+        # fsutil può rappresentare 0x80000000 come -2147483648
+        if ($value -lt 0) {
+            return $value + 4294967296
         }
 
-        return [uint32]$signed
+        return $value
     }
     catch {
         return $null
     }
 }
 
-# ============================================================
-# HELPER: verifica che TUTTI i flag siano presenti
-# ============================================================
-
 function Test-ReasonMask {
 
     param(
         [Parameter(Mandatory = $true)]
-        [uint32]$Reason,
+        [int64]$Reason,
 
         [Parameter(Mandatory = $true)]
-        [uint32[]]$RequiredFlags
+        [int64[]]$RequiredFlags
     )
 
-    $required = [uint32]0
+    $required = [int64]0
 
     foreach ($flag in $RequiredFlags) {
         $required = $required -bor $flag
@@ -158,22 +140,18 @@ function Test-ReasonMask {
     return (($Reason -band $required) -eq $required)
 }
 
-# ============================================================
-# HELPER: restituisce i flag leggibili
-# ============================================================
-
 function Get-ReasonNames {
 
     param(
         [Parameter(Mandatory = $true)]
-        [uint32]$Reason
+        [int64]$Reason
     )
 
     $names = New-Object System.Collections.Generic.List[string]
 
     foreach ($entry in $USN.GetEnumerator()) {
 
-        $flag = [uint32]$entry.Value
+        $flag = [int64]$entry.Value
 
         if (($Reason -band $flag) -eq $flag) {
             $names.Add($entry.Key)
@@ -183,6 +161,9 @@ function Get-ReasonNames {
     return $names.ToArray()
 }
 
+# ============================================================
+# HELPER: restituisce i flag leggibili
+# ============================================================
 # ============================================================
 # PATTERN
 #
@@ -483,7 +464,6 @@ Write-Host "[+] Righe ricevute: $($raw.Count)" -ForegroundColor Green
 # ============================================================
 # FIND CSV HEADER
 # ============================================================
-
 $headerIndex = -1
 
 for ($i = 0; $i -lt $raw.Count; $i++) {
@@ -564,7 +544,7 @@ foreach ($record in $records) {
     # Il nome della colonna può essere "Reason".
     $reasonValue = $record.Reason
 
-    $reason = Convert-ToReasonUInt32 $reasonValue
+    $reason = Convert-ToReasonInt64 $reasonValue
 
     if ($null -eq $reason) {
         continue
