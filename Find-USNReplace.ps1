@@ -2,12 +2,26 @@
 
 <#
 .SYNOPSIS
-    USN Replace Detector v2
+    USN Replace Detector v3
 
 .DESCRIPTION
     Analizza il Windows NTFS USN Change Journal alla ricerca
     di combinazioni di USN_REASON flag compatibili con le
     sequenze configurate nel detector.
+
+    Per Explorer viene utilizzato un doppio metodo:
+
+    1. Metodo primario:
+       FILE_DELETE + CLOSE
+
+    2. Fallback:
+       se il metodo primario non produce alcun indicatore
+       Explorer, viene eseguito un controllo alternativo
+       basato su RENAME_OLD_NAME.
+
+    Il fallback è separato dal metodo primario perché
+    RENAME_OLD_NAME non è semanticamente equivalente
+    a FILE_DELETE e può rappresentare una normale rinomina.
 
     Il tool è destinato a finalità di detection e digital forensics.
     Un match è un INDICATORE e non costituisce, da solo,
@@ -17,7 +31,7 @@
     illusionehh
 
 .VERSION
-    2.0
+    3.0
 #>
 
 param(
@@ -56,7 +70,9 @@ Write-Host ""
 # USN REASON FLAGS
 # Microsoft documented values
 # ============================================================
+
 $USN = [ordered]@{
+
     DATA_OVERWRITE        = [int64]1
     DATA_EXTEND           = [int64]2
     DATA_TRUNCATION       = [int64]4
@@ -75,9 +91,13 @@ $USN = [ordered]@{
 
     BASIC_INFO_CHANGE     = [int64]32768
 
-    # 0x80000000 = 2147483648
+    # 0x80000000
     CLOSE                 = [int64]2147483648
 }
+
+# ============================================================
+# HELPER: Reason -> Int64
+# ============================================================
 
 function Convert-ToReasonInt64 {
 
@@ -98,16 +118,22 @@ function Convert-ToReasonInt64 {
     }
 
     try {
+
+        # Valore esadecimale
         if ($text -match '^0x[0-9a-fA-F]+$') {
-            return [int64]([Convert]::ToInt64(
-                $text.Substring(2),
-                16
-            ))
+
+            return [int64](
+                [Convert]::ToInt64(
+                    $text.Substring(2),
+                    16
+                )
+            )
         }
 
         $value = [int64]$text
 
-        # fsutil può rappresentare 0x80000000 come -2147483648
+        # fsutil può rappresentare:
+        # 0x80000000 come -2147483648
         if ($value -lt 0) {
             return $value + 4294967296
         }
@@ -118,6 +144,10 @@ function Convert-ToReasonInt64 {
         return $null
     }
 }
+
+# ============================================================
+# HELPER: Reason mask
+# ============================================================
 
 function Test-ReasonMask {
 
@@ -137,6 +167,10 @@ function Test-ReasonMask {
 
     return (($Reason -band $required) -eq $required)
 }
+
+# ============================================================
+# HELPER: Reason names
+# ============================================================
 
 function Get-ReasonNames {
 
@@ -160,20 +194,18 @@ function Get-ReasonNames {
 }
 
 # ============================================================
-# HELPER: restituisce i flag leggibili
-# ============================================================
-# ============================================================
-# PATTERN
+# PATTERN PRINCIPALI
 #
-# Ogni elemento rappresenta un SINGOLO USN record.
-# All'interno del record, tutti i flag indicati devono essere
-# presenti contemporaneamente.
+# Questi vengono sempre analizzati.
+#
+# Il controllo RENAME_OLD_NAME NON è qui:
+# viene utilizzato solamente come fallback Explorer.
 # ============================================================
 
 $Patterns = @(
 
     # --------------------------------------------------------
-    # EXPLORER
+    # EXPLORER - METODO PRIMARIO
     # --------------------------------------------------------
 
     [PSCustomObject]@{
@@ -182,14 +214,6 @@ $Patterns = @(
         Required  = @(
             $USN.FILE_DELETE,
             $USN.CLOSE
-        )
-    },
-
-    [PSCustomObject]@{
-        Technique = "Explorer"
-        Variant   = "Rename Old Name"
-        Required  = @(
-            $USN.RENAME_OLD_NAME
         )
     },
 
@@ -423,15 +447,33 @@ $Patterns = @(
 )
 
 # ============================================================
+# EXPLORER FALLBACK
+#
+# Viene utilizzato SOLO se il metodo primario
+# FILE_DELETE + CLOSE non produce match Explorer.
+# ============================================================
+
+$ExplorerFallback = [PSCustomObject]@{
+    Technique = "Explorer"
+    Variant   = "Rename Old Name + Close (fallback)"
+    Required  = @(
+        $USN.RENAME_OLD_NAME,
+        $USN.CLOSE
+    )
+}
+
+# ============================================================
 # CHECK DRIVE
 # ============================================================
 
 if (-not (Test-Path "$Drive\")) {
+
     Write-Host "[!] Drive $Drive non trovata." -ForegroundColor Red
     exit 1
 }
 
 if (-not (Get-Command fsutil.exe -ErrorAction SilentlyContinue)) {
+
     Write-Host "[!] fsutil.exe non disponibile." -ForegroundColor Red
     exit 1
 }
@@ -453,6 +495,7 @@ $raw = @(
 )
 
 if ($raw.Count -eq 0) {
+
     Write-Host "[!] Nessun dato restituito da fsutil." -ForegroundColor Red
     exit 1
 }
@@ -462,6 +505,7 @@ Write-Host "[+] Righe ricevute: $($raw.Count)" -ForegroundColor Green
 # ============================================================
 # FIND CSV HEADER
 # ============================================================
+
 $headerIndex = -1
 
 for ($i = 0; $i -lt $raw.Count; $i++) {
@@ -473,6 +517,7 @@ for ($i = 0; $i -lt $raw.Count; $i++) {
         $line -match '^(?i)"?Usn"?,' -or
         $line -match '^(?i)MajorVersion,'
     ) {
+
         $headerIndex = $i
         break
     }
@@ -505,6 +550,7 @@ $csvText = (
 )
 
 try {
+
     $records = @(
         $csvText | ConvertFrom-Csv
     )
@@ -517,6 +563,7 @@ catch {
 }
 
 if ($records.Count -eq 0) {
+
     Write-Host "[!] Nessun record CSV interpretato." -ForegroundColor Red
     exit 1
 }
@@ -533,14 +580,25 @@ $findings = New-Object System.Collections.Generic.List[object]
 $processed = 0
 $matches   = 0
 
+# Conta SOLO i match Explorer del metodo primario.
+$explorerPrimaryMatches = 0
+
 Write-Host "[*] Analisi Reason bitmask..." -ForegroundColor Cyan
 
 foreach ($record in $records) {
 
     $processed++
 
-    # Il nome della colonna può essere "Reason".
-    if ($null -eq $reasonValue -or [string]::IsNullOrWhiteSpace([string]$reasonValue)) {
+    # --------------------------------------------------------
+    # REASON
+    # --------------------------------------------------------
+
+    $reasonValue = $record.Reason
+
+    if (
+        $null -eq $reasonValue -or
+        [string]::IsNullOrWhiteSpace([string]$reasonValue)
+    ) {
         continue
     }
 
@@ -549,6 +607,10 @@ foreach ($record in $records) {
     if ($null -eq $reason) {
         continue
     }
+
+    # --------------------------------------------------------
+    # PATTERN PRINCIPALI
+    # --------------------------------------------------------
 
     foreach ($pattern in $Patterns) {
 
@@ -560,6 +622,10 @@ foreach ($record in $records) {
 
             $matches++
 
+            if ($pattern.Technique -eq "Explorer") {
+                $explorerPrimaryMatches++
+            }
+
             $reasonNames = Get-ReasonNames $reason
 
             $findings.Add(
@@ -567,6 +633,7 @@ foreach ($record in $records) {
                     TimeStamp       = $record.TimeStamp
                     Technique       = $pattern.Technique
                     Variant         = $pattern.Variant
+                    DetectionMode   = "Primary"
                     FileName        = $record.FileName
                     FileReference   = $record.FileReferenceNumber
                     ParentReference = $record.ParentFileReferenceNumber
@@ -587,8 +654,99 @@ foreach ($record in $records) {
     }
 
     if (($processed % 50000) -eq 0) {
-        Write-Host "[*] Processati: $processed / $($records.Count)" -ForegroundColor DarkGray
+
+        Write-Host `
+            "[*] Processati: $processed / $($records.Count)" `
+            -ForegroundColor DarkGray
     }
+}
+
+# ============================================================
+# EXPLORER FALLBACK
+#
+# Se Explorer FILE_DELETE + CLOSE non ha prodotto alcun
+# match, effettuiamo il secondo controllo RENAME_OLD_NAME.
+# ============================================================
+
+if ($explorerPrimaryMatches -eq 0) {
+
+    Write-Host ""
+    Write-Host "[!] Nessun match Explorer con FILE_DELETE + CLOSE." `
+        -ForegroundColor Yellow
+
+    Write-Host `
+        "[*] Avvio controllo Explorer alternativo: RENAME_OLD_NAME + CLOSE..."
+        -ForegroundColor Cyan
+
+    $fallbackMatches = 0
+
+    foreach ($record in $records) {
+
+        $reasonValue = $record.Reason
+
+        if (
+            $null -eq $reasonValue -or
+            [string]::IsNullOrWhiteSpace([string]$reasonValue)
+        ) {
+            continue
+        }
+
+        $reason = Convert-ToReasonInt64 $reasonValue
+
+        if ($null -eq $reason) {
+            continue
+        }
+
+        if (
+            Test-ReasonMask `
+                -Reason $reason `
+                -RequiredFlags $ExplorerFallback.Required
+        ) {
+
+            $fallbackMatches++
+            $matches++
+
+            $reasonNames = Get-ReasonNames $reason
+
+            $findings.Add(
+                [PSCustomObject]@{
+                    TimeStamp       = $record.TimeStamp
+                    Technique       = $ExplorerFallback.Technique
+                    Variant         = $ExplorerFallback.Variant
+                    DetectionMode   = "Fallback"
+                    FileName        = $record.FileName
+                    FileReference   = $record.FileReferenceNumber
+                    ParentReference = $record.ParentFileReferenceNumber
+                    USN             = $record.Usn
+                    ReasonDecimal   = $reason
+                    ReasonHex       = ("0x{0:X8}" -f $reason)
+                    ReasonsPresent  = ($reasonNames -join " | ")
+                    RequiredFlags   = (
+                        $ExplorerFallback.Required |
+                        ForEach-Object {
+                            "0x{0:X8}" -f $_
+                        }
+                    ) -join " | "
+                    Indicator       = "MATCH"
+                }
+            )
+        }
+    }
+
+    Write-Host `
+        "[+] Match fallback RENAME_OLD_NAME: $fallbackMatches" `
+        -ForegroundColor Green
+}
+else {
+
+    Write-Host ""
+    Write-Host `
+        "[+] Explorer primario ha prodotto $explorerPrimaryMatches match." `
+        -ForegroundColor Green
+
+    Write-Host `
+        "[*] Fallback RENAME_OLD_NAME non necessario." `
+        -ForegroundColor DarkGray
 }
 
 # ============================================================
@@ -601,8 +759,9 @@ Write-Host "             ANALYSIS COMPLETE" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
-Write-Host "Record analizzati : $processed" -ForegroundColor Gray
-Write-Host "Match trovati     : $matches" -ForegroundColor Gray
+Write-Host "Record analizzati        : $processed" -ForegroundColor Gray
+Write-Host "Match totali             : $matches" -ForegroundColor Gray
+Write-Host "Explorer primary matches : $explorerPrimaryMatches" -ForegroundColor Gray
 Write-Host ""
 
 if ($findings.Count -eq 0) {
@@ -622,6 +781,7 @@ else {
             TimeStamp,
             Technique,
             Variant,
+            DetectionMode,
             FileName,
             ReasonHex `
             -Wrap `
@@ -637,15 +797,23 @@ else {
 
         Write-Host ""
         Write-Host "[+] Report CSV salvato in:" -ForegroundColor Green
-        Write-Host "    $((Resolve-Path $OutputCsv).Path)" -ForegroundColor Cyan
+
+        Write-Host `
+            "    $((Resolve-Path $OutputCsv).Path)" `
+            -ForegroundColor Cyan
     }
     catch {
 
         Write-Host ""
-        Write-Host "[!] Impossibile creare il CSV: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host `
+            "[!] Impossibile creare il CSV: $($_.Exception.Message)" `
+            -ForegroundColor Red
     }
 }
 
 Write-Host ""
-Write-Host "Nota: un MATCH è un indicatore e richiede verifica forense." -ForegroundColor DarkYellow
+Write-Host `
+    "Nota: un MATCH è un indicatore e richiede verifica forense." `
+    -ForegroundColor DarkYellow
+
 Write-Host ""
