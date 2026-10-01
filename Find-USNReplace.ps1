@@ -674,9 +674,7 @@ if ($explorerPrimaryMatches -eq 0) {
     Write-Host "[!] Nessun match Explorer con FILE_DELETE + CLOSE." `
         -ForegroundColor Yellow
 
-    Write-Host `
-        "[*] Avvio controllo Explorer alternativo: RENAME_OLD_NAME + CLOSE..." `
-        -ForegroundColor Cyan
+    Write-Host "[*] Avvio controllo Explorer alternativo: RENAME_OLD_NAME + CLOSE..." -ForegroundColor Cyan
 
     $fallbackMatches = 0
 
