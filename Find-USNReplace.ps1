@@ -21,6 +21,12 @@
     Exact    = il record deve avere ESATTAMENTE i flag del passo (default, fedele alle righe elencate).
     Contains = il record deve avere ALMENO i flag del passo.
 
+.PARAMETER PriorityExt
+    Estensioni prioritarie: le sequenze che coinvolgono questi file compaiono per prime nell'anteprima a schermo.
+
+.PARAMETER PfCsv
+    CSV separato per le sequenze che coinvolgono file .pf (default: <OutputCsv>_pf.csv). Le .pf non vanno nel CSV principale ne' nell'anteprima.
+
 .PARAMETER SelfTest
     Esegue il motore su record sintetici (sequenze valide e da scartare) e verifica i conteggi attesi.
 
@@ -42,6 +48,8 @@ param(
     [int]$ReasonCol = -1,
     [int]$NameCol = -1,
     [int]$FileIdCol = -1,
+    [string[]]$PriorityExt = @('.exe', '.dll', '.jar', '.ini', '.py'),
+    [string]$PfCsv,
     [switch]$SelfTest
 )
 
@@ -211,7 +219,7 @@ $expected = $null
 if ($SelfTest) {
     # Record sintetici: (reason, file). Gli USN sono generati in ordine crescente.
     $syn = @(
-        @(0x00000006L, 'a.txt'),    #  1  Ext|Trunc
+        @(0x00000006L, 'a.exe'),    #  1  Ext|Trunc
         @(0x80000006L, 'a.txt'),    #  2  Ext|Trunc|Close            -> Type 1 (1-2)
         @(0x80000200L, 'b.txt'),    #  3  Delete|Close
         @(0x00001000L, 'b.txt'),    #  4  Rename old
@@ -220,7 +228,7 @@ if ($SelfTest) {
         @(0x00000002L, 'd.txt'),    #  7  Extend
         @(0x00000100L, 'e.txt'),    #  8  File create  (interrompe)
         @(0x00000004L, 'd.txt'),    #  9  Trunc                      -> NON deve dare match con 7
-        @(0x00000006L, 'f.txt'),    # 10  Ext|Trunc                  -> Type 2 (9-10)
+        @(0x00000006L, 'f.pf'),     # 10  Ext|Trunc                  -> Type 2 (9-10)
         @(0x00001000L, 'g.txt'),    # 11  Rename old (separatore)
         @(0x00000002L, 'h.txt'),    # 12  Extend
         @(0x00000003L, 'h.txt'),    # 13  Over|Ext
@@ -352,12 +360,29 @@ $swRead.Stop()
 $swScan = [Diagnostics.Stopwatch]::StartNew()
 $exact = ($MatchMode -eq 'Exact')
 $cover = New-Object 'int[]' $n
-$matchId = 0
-$previewRows = New-Object System.Collections.Generic.List[object]
+$cls = New-Object 'int[]' $n
+for ($i = 0; $i -lt $n; $i++) { $cls[$i] = -1 }
+
+# Classi per estensione: 1 = prioritaria, 2 = prefetch (.pf, CSV separato)
+$extClass = @{ '.pf' = 2 }
+foreach ($e in $PriorityExt) {
+    $x = $e.Trim().ToLowerInvariant()
+    if (-not $x.StartsWith('.')) { $x = '.' + $x }
+    if ($x -ne '.pf') { $extClass[$x] = 1 }
+}
+if (-not $PfCsv) {
+    $PfCsv = [IO.Path]::Combine((Split-Path $OutputCsv -Parent), ([IO.Path]::GetFileNameWithoutExtension($OutputCsv) + '_pf.csv'))
+}
+
+$matchId = 0; $cntPrio = 0; $cntPf = 0; $cntOther = 0
+$prioRows = New-Object System.Collections.Generic.List[object]
+$otherRows = New-Object System.Collections.Generic.List[object]
+$csvHeader = (@('MatchId', 'Regola', 'Passo', 'PassiTotali', 'USN', 'MotivoHex', 'Motivo', 'Percorso', 'FileId', 'Esito', 'Priorita') -join $Delimiter)
 
 $sw = New-Object System.IO.StreamWriter($OutputCsv, $false, (New-Object System.Text.UTF8Encoding($true)))
+$swPf = $null
 try {
-    $sw.WriteLine((@('MatchId', 'Regola', 'Passo', 'PassiTotali', 'USN', 'MotivoHex', 'Motivo', 'Percorso', 'FileId', 'Esito') -join $Delimiter))
+    $sw.WriteLine($csvHeader)
 
     for ($i = 0; $i -lt $n; $i++) {
         if ($exact) {
@@ -381,27 +406,71 @@ try {
 
             $matchId++
             $perRule[$rule.Name]++
+
+            # Classificazione della sequenza: .pf se almeno un record e' .pf, altrimenti
+            # prioritaria se almeno un record ha un'estensione prioritaria
+            $seqCls = 0
+            for ($k = 0; $k -lt $len; $k++) {
+                $idx = $i + $k
+                $c = $cls[$idx]
+                if ($c -lt 0) {
+                    $c = 0
+                    $nm = $NM[$idx]
+                    $d = $nm.LastIndexOf('.')
+                    if ($d -ge 0) {
+                        $ext = $nm.Substring($d).Trim().ToLowerInvariant()
+                        if ($extClass.ContainsKey($ext)) { $c = $extClass[$ext] }
+                    }
+                    $cls[$idx] = $c
+                }
+                if ($c -eq 2) { $seqCls = 2 }
+                elseif ($c -eq 1 -and $seqCls -eq 0) { $seqCls = 1 }
+            }
+
+            if ($seqCls -eq 2) {
+                $cntPf++
+                if ($null -eq $swPf) {
+                    $swPf = New-Object System.IO.StreamWriter($PfCsv, $false, (New-Object System.Text.UTF8Encoding($true)))
+                    $swPf.WriteLine($csvHeader)
+                }
+                $out = $swPf; $label = 'Prefetch (.pf)'
+            }
+            elseif ($seqCls -eq 1) { $cntPrio++; $out = $sw; $label = 'Prioritario' }
+            else { $cntOther++; $out = $sw; $label = 'Altro' }
+
             for ($k = 0; $k -lt $len; $k++) {
                 $idx = $i + $k
                 $cover[$idx]++
-                $sw.WriteLine((@(
+                $out.WriteLine((@(
                             $matchId, (Esc $rule.Name), ($k + 1), $len, $U[$idx],
                             ('0x{0:X8}' -f $R[$idx]), (Esc (Get-ReasonText $R[$idx])),
-                            (Esc $NM[$idx]), (Esc $FID[$idx]), 'Sequenza rilevata'
+                            (Esc $NM[$idx]), (Esc $FID[$idx]), 'Sequenza rilevata', $label
                         ) -join $Delimiter))
             }
-            if ($previewRows.Count -lt $Preview) {
-                $previewRows.Add([pscustomobject]@{
-                        Id     = $matchId
-                        Regola = $rule.Name
-                        USN    = (($i..($i + $len - 1)) | ForEach-Object { $U[$_] }) -join ' > '
-                        File   = (($i..($i + $len - 1)) | ForEach-Object { $NM[$_] }) -join ' > '
-                    })
+
+            # Anteprima a schermo: le .pf non compaiono, le prioritarie hanno la precedenza
+            if ($seqCls -ne 2) {
+                $target = if ($seqCls -eq 1) { $prioRows } else { $otherRows }
+                if ($target.Count -lt $Preview) {
+                    $target.Add([pscustomobject]@{
+                            Id     = $matchId
+                            Regola = $rule.Name
+                            Tipo   = $label
+                            USN    = (($i..($i + $len - 1)) | ForEach-Object { $U[$_] }) -join ' > '
+                            File   = (($i..($i + $len - 1)) | ForEach-Object { $NM[$_] }) -join ' > '
+                        })
+                }
             }
         }
     }
 }
-finally { $sw.Dispose() }
+finally {
+    $sw.Dispose()
+    if ($null -ne $swPf) { $swPf.Dispose() }
+}
+$previewRows = New-Object System.Collections.Generic.List[object]
+foreach ($r in $prioRows) { $previewRows.Add($r) }
+foreach ($r in $otherRows) { if ($previewRows.Count -lt $Preview) { $previewRows.Add($r) } }
 $swScan.Stop()
 
 # ----------------------------------------------------------------------------
@@ -411,30 +480,4 @@ $involved = 0; $overlap = 0
 foreach ($c in $cover) { if ($c -gt 0) { $involved++ }; if ($c -gt 1) { $overlap++ } }
 
 Write-Host ''
-Write-Host '=== Replacer v5 - riepilogo ===' -ForegroundColor Green
-Write-Host ("Modalita' di confronto : {0}" -f $MatchMode)
-Write-Host ("Righe dati lette       : {0:N0}" -f $rowsRead)
-Write-Host ("Record interpretati    : {0:N0}  (scartati: {1:N0})" -f $n, $rowsSkipped)
-if ($unknownText -gt 0) { Write-Host ("Descrizioni non riconosciute: {0:N0}" -f $unknownText) -ForegroundColor Yellow }
-Write-Host ("Sequenze rilevate      : {0:N0}" -f $matchId)
-Write-Host ("Record coinvolti       : {0:N0}  (di cui in piu' sequenze: {1:N0})" -f $involved, $overlap)
-Write-Host ''
-$perRule.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Regola = $_.Key; Sequenze = $_.Value } } | Format-Table -AutoSize
-Write-Host ("Tempi: lettura {0:N1}s, scansione {1:N1}s, totale {2:N1}s" -f $swRead.Elapsed.TotalSeconds, $swScan.Elapsed.TotalSeconds, $swTotal.Elapsed.TotalSeconds)
-Write-Host ("CSV: {0}" -f $OutputCsv)
-
-if ($previewRows.Count -gt 0) {
-    Write-Host ("`nPrime {0} sequenze:" -f $previewRows.Count) -ForegroundColor Green
-    $previewRows | Format-Table -AutoSize -Wrap
-}
-
-if ($SelfTest) {
-    $fail = $false
-    foreach ($k in $expected.Keys) {
-        $got = $perRule[$k]
-        $tag = if ($got -eq $expected[$k]) { 'OK  ' } else { $fail = $true; 'FAIL' }
-        Write-Host ("[{0}] {1}: atteso {2}, ottenuto {3}" -f $tag, $k, $expected[$k], $got)
-    }
-    if ($fail) { Write-Host 'SelfTest: FALLITO' -ForegroundColor Red; exit 1 }
-    else { Write-Host 'SelfTest: SUPERATO' -ForegroundColor Green }
-}
+Write-Host '=== Replacer v5 - riepilogo ===' -
