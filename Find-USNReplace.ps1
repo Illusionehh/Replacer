@@ -415,10 +415,10 @@ try {
                 $c = $cls[$idx]
                 if ($c -lt 0) {
                     $c = 0
-                    $nm = $NM[$idx]
-                    $d = $nm.LastIndexOf('.')
+                    $fname = $NM[$idx]
+                    $d = $fname.LastIndexOf('.')
                     if ($d -ge 0) {
-                        $ext = $nm.Substring($d).Trim().ToLowerInvariant()
+                        $ext = $fname.Substring($d).Trim().ToLowerInvariant()
                         if ($extClass.ContainsKey($ext)) { $c = $extClass[$ext] }
                     }
                     $cls[$idx] = $c
@@ -450,7 +450,8 @@ try {
 
             # Anteprima a schermo: le .pf non compaiono, le prioritarie hanno la precedenza
             if ($seqCls -ne 2) {
-                $target = if ($seqCls -eq 1) { $prioRows } else { $otherRows }
+                $target = $otherRows
+                if ($seqCls -eq 1) { $target = $prioRows }
                 if ($target.Count -lt $Preview) {
                     $target.Add([pscustomobject]@{
                             Id     = $matchId
@@ -469,8 +470,8 @@ finally {
     if ($null -ne $swPf) { $swPf.Dispose() }
 }
 $previewRows = New-Object System.Collections.Generic.List[object]
-foreach ($r in $prioRows) { $previewRows.Add($r) }
-foreach ($r in $otherRows) { if ($previewRows.Count -lt $Preview) { $previewRows.Add($r) } }
+foreach ($pr in $prioRows) { $previewRows.Add($pr) }
+foreach ($orow in $otherRows) { if ($previewRows.Count -lt $Preview) { $previewRows.Add($orow) } }
 $swScan.Stop()
 
 # ----------------------------------------------------------------------------
@@ -480,4 +481,4 @@ $involved = 0; $overlap = 0
 foreach ($c in $cover) { if ($c -gt 0) { $involved++ }; if ($c -gt 1) { $overlap++ } }
 
 Write-Host ''
-Write-Host '=== Replacer v5 - riepilogo ===' -
+Write-Host '
