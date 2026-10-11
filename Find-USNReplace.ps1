@@ -16,6 +16,17 @@ param(
     [switch]$SelfTest
 )
 
+Write-Host '  ▄▄▄▄▄▄               ▄▄                         ' -ForegroundColor Cyan
+Write-Host ' █▀██▀▀▀█▄              ██                        ' -ForegroundColor Cyan
+Write-Host '   ██▄▄▄█▀              ██                   ▄    ' -ForegroundColor Cyan
+Write-Host '   ██▀▀█▄   ▄█▀█▄ ████▄ ██ ▄▀▀█▄ ▄███▀ ▄█▀█▄ ████▄' -ForegroundColor Cyan
+Write-Host ' ▄ ██  ██   ██▄█▀ ██ ██ ██ ▄█▀██ ██    ██▄█▀ ██   ' -ForegroundColor Cyan
+Write-Host ' ▀██▀  ▀██▀▄▀█▄▄▄▄████▀▄██▄▀█▄██▄▀███▄▄▀█▄▄▄▄█▀   ' -ForegroundColor Cyan
+Write-Host '                  ██                              ' -ForegroundColor Cyan
+Write-Host '                  ▀                               ' -ForegroundColor Cyan
+Write-Host '                                                  ' -ForegroundColor Cyan
+Write-Host '              Made by Illusioneh                  ' -ForegroundColor Cyan
+
 $ErrorActionPreference = 'Stop'
 $swTotal = [Diagnostics.Stopwatch]::StartNew()
 
