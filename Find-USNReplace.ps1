@@ -1,40 +1,3 @@
-<#
-.SYNOPSIS
-    Replacer v5 - rilevatore di sequenze CONSECUTIVE di record nel Journal USN.
-
-.DESCRIPTION
-    - Legge il journal una sola volta (fsutil usn readjournal <drive> csv, oppure un file gia' salvato).
-    - Lavora solo su bitmask numerici (nessun confronto testuale durante la scansione).
-    - Scorre i record in ordine USN. Una regola e' una sequenza di record: ogni passo
-      della regola e' UN record, e i passi devono essere record adiacenti (nessun record in mezzo).
-    - I motivi multipli dentro una riga ("Data Extend | Data Truncation") sono flag dello STESSO record.
-    - Gli eventi possono riguardare file diversi: nome file / File ID non vengono mai vincolati.
-    - Ogni sequenza trovata viene scritta nel CSV (una riga per record coinvolto) e riassunta in console.
-
-.PARAMETER Drive
-    Volume da analizzare (default: unita' di sistema). Servono privilegi di amministratore.
-
-.PARAMETER InputFile
-    Usa un file CSV gia' esportato (fsutil usn readjournal X: csv > file) invece di interrogare il volume.
-
-.PARAMETER MatchMode
-    Exact    = il record deve avere ESATTAMENTE i flag del passo (default, fedele alle righe elencate).
-    Contains = il record deve avere ALMENO i flag del passo.
-
-.PARAMETER PriorityExt
-    Estensioni prioritarie: le sequenze che coinvolgono questi file compaiono per prime nell'anteprima a schermo.
-
-.PARAMETER PfCsv
-    CSV separato per le sequenze che coinvolgono file .pf (default: <OutputCsv>_pf.csv). Le .pf non vanno nel CSV principale ne' nell'anteprima.
-
-.PARAMETER SelfTest
-    Esegue il motore su record sintetici (sequenze valide e da scartare) e verifica i conteggi attesi.
-
-.EXAMPLE
-    .\Replacer_v5.ps1 -Drive C:
-    .\Replacer_v5.ps1 -InputFile .\usn.csv -MatchMode Contains
-    .\Replacer_v5.ps1 -SelfTest
-#>
 [CmdletBinding()]
 param(
     [string]$Drive = $env:SystemDrive,
@@ -42,7 +5,7 @@ param(
     [string]$OutputCsv = (Join-Path (Get-Location) ("Replacer_v5_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))),
     [ValidateSet('Exact', 'Contains')][string]$MatchMode = 'Exact',
     [ValidateSet('OEM', 'UTF8')][string]$Encoding = 'OEM',
-    [string]$Delimiter = ';',
+    [string]$Delimiter = ',',
     [int]$Preview = 25,
     [int]$UsnCol = -1,
     [int]$ReasonCol = -1,
@@ -56,9 +19,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $swTotal = [Diagnostics.Stopwatch]::StartNew()
 
-# ----------------------------------------------------------------------------
-# 1. Flag dei motivi USN (valori numerici ufficiali)
-# ----------------------------------------------------------------------------
 $Flags = [ordered]@{
     DataOverwrite       = 0x00000001L
     DataExtend          = 0x00000002L
@@ -86,7 +46,6 @@ $Flags = [ordered]@{
 }
 $flagList = @($Flags.GetEnumerator() | Sort-Object Value)
 
-# Mappa testo -> valore, usata solo come ripiego quando nel CSV manca il valore esadecimale
 $TextMap = @{}
 foreach ($e in $flagList) { $TextMap[$e.Key.ToLowerInvariant()] = [long]$e.Value }
 $TextMap['extendedattributechange'] = [long]$Flags['EaChange']
@@ -98,9 +57,6 @@ function Mask {
     return $m
 }
 
-# ----------------------------------------------------------------------------
-# 2. Regole: ogni voce = sequenza di record consecutivi; ogni elemento = maschera di UN record
-# ----------------------------------------------------------------------------
 $RuleDefs = [ordered]@{
     'Explorer' = @(
         (Mask 'FileDelete', 'Close'),
@@ -148,7 +104,7 @@ foreach ($name in $RuleDefs.Keys) {
     $ruleObjs.Add([pscustomobject]@{ Name = $name; Masks = $masks; Len = $masks.Length })
     $perRule[$name] = 0
 }
-# Indice sul primo passo: in modalita' Exact evita di provare tutte le regole su ogni record
+
 $firstIndex = @{}
 foreach ($r in $ruleObjs) {
     $k = [long]$r.Masks[0]
@@ -156,9 +112,6 @@ foreach ($r in $ruleObjs) {
     $firstIndex[$k].Add($r)
 }
 
-# ----------------------------------------------------------------------------
-# 3. Utility
-# ----------------------------------------------------------------------------
 $textCache = @{}
 function Get-ReasonText {
     param([long]$Value)
@@ -210,29 +163,26 @@ function Esc {
     return '"' + $s.Replace('"', '""') + '"'
 }
 
-# ----------------------------------------------------------------------------
-# 4. Sorgente dati (self-test, file oppure fsutil)
-# ----------------------------------------------------------------------------
 $tempToDelete = $null
 $expected = $null
 
 if ($SelfTest) {
-    # Record sintetici: (reason, file). Gli USN sono generati in ordine crescente.
+
     $syn = @(
-        @(0x00000006L, 'a.exe'),    #  1  Ext|Trunc
-        @(0x80000006L, 'a.txt'),    #  2  Ext|Trunc|Close            -> Type 1 (1-2)
-        @(0x80000200L, 'b.txt'),    #  3  Delete|Close
-        @(0x00001000L, 'b.txt'),    #  4  Rename old
-        @(0x00002000L, 'c.txt'),    #  5  Rename new  (file diverso)
-        @(0x80002000L, 'c.txt'),    #  6  Rename new|Close           -> Explorer (3-6)
-        @(0x00000002L, 'd.txt'),    #  7  Extend
-        @(0x00000100L, 'e.txt'),    #  8  File create  (interrompe)
-        @(0x00000004L, 'd.txt'),    #  9  Trunc                      -> NON deve dare match con 7
-        @(0x00000006L, 'f.pf'),     # 10  Ext|Trunc                  -> Type 2 (9-10)
-        @(0x00001000L, 'g.txt'),    # 11  Rename old (separatore)
-        @(0x00000002L, 'h.txt'),    # 12  Extend
-        @(0x00000003L, 'h.txt'),    # 13  Over|Ext
-        @(0x80000003L, 'h.txt')     # 14  Over|Ext|Close             -> HEX 1 (12-14), HEX 2 (13-14)
+        @(0x00000006L, 'a.exe'),
+        @(0x80000006L, 'a.txt'),
+        @(0x80000200L, 'b.txt'),
+        @(0x00001000L, 'b.txt'),
+        @(0x00002000L, 'c.txt'),
+        @(0x80002000L, 'c.txt'),
+        @(0x00000002L, 'd.txt'),
+        @(0x00000100L, 'e.txt'),
+        @(0x00000004L, 'd.txt'),
+        @(0x00000006L, 'f.pf'),
+        @(0x00001000L, 'g.txt'),
+        @(0x00000002L, 'h.txt'),
+        @(0x00000003L, 'h.txt'),
+        @(0x80000003L, 'h.txt')
     )
     $tempToDelete = [IO.Path]::GetTempFileName()
     $lines = New-Object System.Collections.Generic.List[string]
@@ -266,9 +216,6 @@ $enc = if ($Encoding -eq 'OEM') {
     [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
 } else { New-Object System.Text.UTF8Encoding($false) }
 
-# ----------------------------------------------------------------------------
-# 5. Parsing (una sola lettura, solo valori numerici per la scansione)
-# ----------------------------------------------------------------------------
 $swRead = [Diagnostics.Stopwatch]::StartNew()
 $usnL = New-Object System.Collections.Generic.List[long]
 $reaL = New-Object System.Collections.Generic.List[long]
@@ -303,13 +250,11 @@ try {
         $need = [Math]::Max($iU, $iR) + 1
         if ($f.Length -lt $need) { $rowsSkipped++; continue }
 
-        # USN
         $us = $f[$iU].Trim()
         $u = 0L
         if ($us.StartsWith('0x')) { try { $u = [Convert]::ToInt64($us.Substring(2), 16) } catch { $rowsSkipped++; continue } }
         elseif (-not [long]::TryParse($us, [ref]$u)) { $rowsSkipped++; continue }
 
-        # Reason: preferisco il valore esadecimale; ripiego sul testo
         $rs = $f[$iR]
         $m = [regex]::Match($rs, '0x([0-9A-Fa-f]{1,8})')
         if ($m.Success) { $rv = [Convert]::ToInt64($m.Groups[1].Value, 16) }
@@ -341,7 +286,6 @@ if (-not $headerFound) {
 $U = $usnL.ToArray(); $R = $reaL.ToArray(); $NM = $namL.ToArray(); $FID = $fidL.ToArray()
 $n = $U.Length
 
-# L'ordine di riferimento e' l'USN: se il file non e' ordinato lo riordino
 if (-not $sorted -and $n -gt 1) {
     Write-Host 'Record non ordinati per USN: riordino.' -ForegroundColor Yellow
     $keys = [long[]]$U.Clone()
@@ -354,16 +298,12 @@ if (-not $sorted -and $n -gt 1) {
 }
 $swRead.Stop()
 
-# ----------------------------------------------------------------------------
-# 6. Scansione unica in ordine USN
-# ----------------------------------------------------------------------------
 $swScan = [Diagnostics.Stopwatch]::StartNew()
 $exact = ($MatchMode -eq 'Exact')
 $cover = New-Object 'int[]' $n
 $cls = New-Object 'int[]' $n
 for ($i = 0; $i -lt $n; $i++) { $cls[$i] = -1 }
 
-# Classi per estensione: 1 = prioritaria, 2 = prefetch (.pf, CSV separato)
 $extClass = @{ '.pf' = 2 }
 foreach ($e in $PriorityExt) {
     $x = $e.Trim().ToLowerInvariant()
@@ -407,8 +347,6 @@ try {
             $matchId++
             $perRule[$rule.Name]++
 
-            # Classificazione della sequenza: .pf se almeno un record e' .pf, altrimenti
-            # prioritaria se almeno un record ha un'estensione prioritaria
             $seqCls = 0
             for ($k = 0; $k -lt $len; $k++) {
                 $idx = $i + $k
@@ -448,7 +386,6 @@ try {
                         ) -join $Delimiter))
             }
 
-            # Anteprima a schermo: le .pf non compaiono, le prioritarie hanno la precedenza
             if ($seqCls -ne 2) {
                 $target = $otherRows
                 if ($seqCls -eq 1) { $target = $prioRows }
@@ -474,11 +411,44 @@ foreach ($pr in $prioRows) { $previewRows.Add($pr) }
 foreach ($orow in $otherRows) { if ($previewRows.Count -lt $Preview) { $previewRows.Add($orow) } }
 $swScan.Stop()
 
-# ----------------------------------------------------------------------------
-# 7. Report
-# ----------------------------------------------------------------------------
 $involved = 0; $overlap = 0
 foreach ($c in $cover) { if ($c -gt 0) { $involved++ }; if ($c -gt 1) { $overlap++ } }
 
 Write-Host ''
+Write-Host '=== Replacer v5 - riepilogo ===' -ForegroundColor Green
+Write-Host ("Modalita' di confronto : {0}" -f $MatchMode)
+Write-Host ("Righe dati lette       : {0:N0}" -f $rowsRead)
+Write-Host ("Record interpretati    : {0:N0}  (scartati: {1:N0})" -f $n, $rowsSkipped)
+if ($unknownText -gt 0) { Write-Host ("Descrizioni non riconosciute: {0:N0}" -f $unknownText) -ForegroundColor Yellow }
+Write-Host ("Sequenze rilevate      : {0:N0}" -f $matchId)
+Write-Host ("  prioritarie ({0}): {1:N0}" -f ($PriorityExt -join ' '), $cntPrio)
+Write-Host ("  altre                : {0:N0}" -f $cntOther)
+Write-Host ("  .pf (CSV separato)   : {0:N0}" -f $cntPf)
+Write-Host ("Record coinvolti       : {0:N0}  (di cui in piu' sequenze: {1:N0})" -f $involved, $overlap)
 Write-Host ''
+$perRule.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Regola = $_.Key; Sequenze = $_.Value } } | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
+Write-Host ("Tempi: lettura {0:N1}s, scansione {1:N1}s, totale {2:N1}s" -f $swRead.Elapsed.TotalSeconds, $swScan.Elapsed.TotalSeconds, $swTotal.Elapsed.TotalSeconds)
+Write-Host ("CSV: {0}" -f $OutputCsv)
+if ($cntPf -gt 0) { Write-Host ("CSV .pf: {0}" -f $PfCsv) }
+
+if ($previewRows.Count -gt 0) {
+    Write-Host ("`nAnteprima ({0} sequenze, prima le prioritarie):" -f $previewRows.Count) -ForegroundColor Green
+    $previewRows | Format-Table -AutoSize -Wrap | Out-String -Width 250 | Write-Host
+}
+
+if ($SelfTest) {
+    $fail = $false
+    foreach ($k in $expected.Keys) {
+        $got = $perRule[$k]
+        $tag = if ($got -eq $expected[$k]) { 'OK  ' } else { $fail = $true; 'FAIL' }
+        Write-Host ("[{0}] {1}: atteso {2}, ottenuto {3}" -f $tag, $k, $expected[$k], $got)
+    }
+    $expCls = [ordered]@{ 'Prioritarie' = 1; 'Prefetch (.pf)' = 1; 'Altro' = 3 }
+    $gotCls = @{ 'Prioritarie' = $cntPrio; 'Prefetch (.pf)' = $cntPf; 'Altro' = $cntOther }
+    foreach ($k in $expCls.Keys) {
+        $tag = if ($gotCls[$k] -eq $expCls[$k]) { 'OK  ' } else { $fail = $true; 'FAIL' }
+        Write-Host ("[{0}] {1}: atteso {2}, ottenuto {3}" -f $tag, $k, $expCls[$k], $gotCls[$k])
+    }
+    if ($fail) { Write-Host 'SelfTest: FALLITO' -ForegroundColor Red; exit 1 }
+    else { Write-Host 'SelfTest: SUPERATO' -ForegroundColor Green }
+}
