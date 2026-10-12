@@ -26,6 +26,18 @@ $ErrorActionPreference = 'Stop'
 $swTotal = [Diagnostics.Stopwatch]::StartNew()
 $runDate = Get-Date
 
+Write-Host '                                                  ' -ForegroundColor Cyan
+Write-Host '  ▄▄▄▄▄▄               ▄▄                         ' -ForegroundColor Cyan
+Write-Host ' █▀██▀▀▀█▄              ██                        ' -ForegroundColor Cyan
+Write-Host '   ██▄▄▄█▀              ██                   ▄    ' -ForegroundColor Cyan
+Write-Host '   ██▀▀█▄   ▄█▀█▄ ████▄ ██ ▄▀▀█▄ ▄███▀ ▄█▀█▄ ████▄' -ForegroundColor Cyan
+Write-Host ' ▄ ██  ██   ██▄█▀ ██ ██ ██ ▄█▀██ ██    ██▄█▀ ██   ' -ForegroundColor Cyan
+Write-Host ' ▀██▀  ▀██▀▄▀█▄▄▄▄████▀▄██▄▀█▄██▄▀███▄▄▀█▄▄▄▄█▀   ' -ForegroundColor Cyan
+Write-Host '                  ██                              ' -ForegroundColor Cyan
+Write-Host '                  ▀                               ' -ForegroundColor Cyan
+Write-Host '                                                  ' -ForegroundColor Cyan
+Write-Host '              Made by Illusioneh                  ' -ForegroundColor Cyan
+
 function Convert-Ext {
     param([string]$Value)
     $x = $Value.Trim().ToLowerInvariant()
