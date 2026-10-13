@@ -18,13 +18,11 @@ param(
     [string[]]$DeleteExt = @('.exe', '.dll', '.jar', '.ini', '.py'),
     [string[]]$Keywords = @('remote', 'clicker', 'injection', 'bypass', 'macro', 'totem', 'destruct', 'bridge'),
     [string[]]$WatchNames = @('jnativehook'),
+    [string]$Dopo,
+    [switch]$TuttoIlJournal,
     [switch]$Tollerante,
     [switch]$SelfTest
 )
-
-$ErrorActionPreference = 'Stop'
-$swTotal = [Diagnostics.Stopwatch]::StartNew()
-$runDate = Get-Date
 
 Write-Host '                                                  ' -ForegroundColor Cyan
 Write-Host '  ▄▄▄▄▄▄               ▄▄                         ' -ForegroundColor Cyan
@@ -37,6 +35,10 @@ Write-Host '                  ██                              ' -ForegroundC
 Write-Host '                  ▀                               ' -ForegroundColor Cyan
 Write-Host '                                                  ' -ForegroundColor Cyan
 Write-Host '              Made by Illusioneh                  ' -ForegroundColor Cyan
+
+$ErrorActionPreference = 'Stop'
+$swTotal = [Diagnostics.Stopwatch]::StartNew()
+$runDate = Get-Date
 
 function Convert-Ext {
     param([string]$Value)
@@ -81,6 +83,34 @@ try { $osBuild = [Environment]::OSVersion.Version.Build } catch { $osBuild = 0 }
 $osName = 'non rilevato'
 if ($osBuild -ge 22000) { $osName = 'Windows 11' }
 elseif ($osBuild -ge 10240) { $osName = 'Windows 10' }
+
+$since = $null
+$sinceLabel = ''
+$sinceNote = ''
+if ($SelfTest -or $TuttoIlJournal) { $sinceNote = 'disattivato (analizzo tutto il journal)' }
+elseif (-not [string]::IsNullOrWhiteSpace($Dopo)) {
+    $dtd = [datetime]::MinValue
+    if (-not [datetime]::TryParse($Dopo.Trim(), [ref]$dtd)) { throw "Valore di -Dopo non valido: '$Dopo' (esempio: '2026-10-13 18:30')." }
+    $since = $dtd
+    $sinceLabel = 'orario indicato con -Dopo'
+}
+elseif (-not $InputFile) {
+    try {
+        $since = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
+        $sinceLabel = 'ultimo avvio del PC'
+    }
+    catch {
+        $since = $null
+        $sinceNote = 'orario di avvio non leggibile: analizzo tutto il journal'
+    }
+}
+else { $sinceNote = 'file esterno: analizzo tutto (usa -Dopo per filtrare)' }
+$sinceTicks = 0L
+if ($null -ne $since) { $sinceTicks = $since.Ticks }
+$tickCache = @{}
+$rowsBefore = 0
+$tsFail = 0
+$tsOk = 0
 
 $Flags = [ordered]@{
     DataOverwrite       = 0x00000001L
@@ -434,6 +464,7 @@ $sr = New-Object System.IO.StreamReader($InputFile, $enc, $true)
 try {
     $iU = $UsnCol; $iR = $ReasonCol; $iN = $NameCol; $iF = $FileIdCol; $iT = $TimeCol; $iA = $AttrCol
     $headerFound = ($iU -ge 0 -and $iR -ge 0)
+    if ($headerFound -and $null -ne $since -and $iT -lt 0) { $since = $null; $sinceNote = 'colonna data non trovata: analizzo tutto (usa -TimeCol)' }
     $need = 0
 
     while ($null -ne ($line = $sr.ReadLine())) {
@@ -451,6 +482,7 @@ try {
                 if ($iT -lt 0) { $iT = Find-Col $hd 'time ?stamp|marca temporale|^data' }
                 if ($iA -lt 0) { $iA = Find-Col $hd 'attribut' }
                 $headerFound = $true
+                if ($null -ne $since -and $iT -lt 0) { $since = $null; $sinceNote = 'colonna data non trovata: analizzo tutto (usa -TimeCol)' }
             }
             continue
         }
@@ -458,6 +490,22 @@ try {
         $rowsRead++
         $need = [Math]::Max($iU, $iR) + 1
         if ($f.Length -lt $need) { $rowsSkipped++; continue }
+
+        if ($null -ne $since) {
+            $traw = ''
+            if ($f.Length -gt $iT) { $traw = $f[$iT] }
+            $tk = $tickCache[$traw]
+            if ($null -eq $tk) {
+                $dtp = [datetime]::MinValue
+                if ([datetime]::TryParse($traw.Trim(), [ref]$dtp)) { $tk = $dtp.Ticks } else { $tk = -1L }
+                $tickCache[$traw] = $tk
+            }
+            if ($tk -lt 0) { $tsFail++ }
+            else {
+                $tsOk++
+                if ($tk -lt $sinceTicks) { $rowsBefore++; continue }
+            }
+        }
 
         $us = $f[$iU].Trim()
         $u = 0L
@@ -693,6 +741,12 @@ Write-Host ("Sistema                : {0} (build {1})" -f $osName, $osBuild)
 Write-Host ("Modalita' di confronto : {0}{1}" -f $MatchMode, $(if ($Tollerante) { ' + tollerante' } else { '' }))
 Write-Host ("Righe dati lette       : {0:N0}" -f $rowsRead)
 Write-Host ("Record interpretati    : {0:N0}  (scartati: {1:N0})" -f $n, $rowsSkipped)
+if ($null -ne $since) {
+    Write-Host ("Filtro data            : solo record dal {0:yyyy-MM-dd HH:mm:ss} ({1}); esclusi {2:N0} record piu' vecchi" -f $since, $sinceLabel, $rowsBefore) -ForegroundColor Cyan
+    if ($tsOk -eq 0 -and $tsFail -gt 0) { Write-Host "Nessuna data del journal e' stata interpretata: il filtro non ha escluso nulla." -ForegroundColor Yellow }
+    if ($sinceLabel -eq 'ultimo avvio del PC') { Write-Host "Se il PC usa l'Avvio rapido, l'orario puo' risalire a un avvio precedente: in quel caso usa -Dopo 'AAAA-MM-GG HH:mm'." -ForegroundColor Yellow }
+}
+elseif ($sinceNote) { Write-Host ("Filtro data            : {0}" -f $sinceNote) }
 if ($unknownText -gt 0) { Write-Host ("Descrizioni non riconosciute: {0:N0}" -f $unknownText) -ForegroundColor Yellow }
 if (-not $hasAttr) { Write-Host 'Colonna attributi non trovata: disattivati Sola lettura (+/-), Icacls e i filtri sugli attributi (usa -AttrCol).' -ForegroundColor Yellow }
 Write-Host ("CSV principale         : {0:N0} rilevamenti  (flag {1:N0}, prioritari {2:N0}, altri {3:N0})" -f $sumMain, $cntMain[0], $cntMain[1], $cntMain[2])
