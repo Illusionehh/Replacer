@@ -458,6 +458,10 @@ function Find-StartUsn {
     $first = $vals[1]
     $next = $vals[2]
     if ($first -lt 0 -or $next -le $first) { return $null }
+    $firstStamp = Get-FirstStamp $Drv $first
+    if ($null -ne $firstStamp -and $firstStamp -ge $Since) {
+        return [pscustomobject]@{ Start = $first; First = $first; Next = $next; Probes = 1 }
+    }
     $lo = $first
     $hi = $next
     $probes = 0
