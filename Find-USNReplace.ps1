@@ -20,6 +20,7 @@ param(
     [string[]]$WatchNames = @('jnativehook'),
     [string]$Dopo,
     [switch]$TuttoIlJournal,
+    [switch]$LetturaCompleta,
     [switch]$Tollerante,
     [switch]$SelfTest
 )
@@ -377,8 +378,112 @@ function Show-Preview {
     }
 }
 
+function Get-Enc {
+    if ($Encoding -eq 'OEM') {
+        try { return [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage) }
+        catch { return (New-Object System.Text.UTF8Encoding($false)) }
+    }
+    return (New-Object System.Text.UTF8Encoding($false))
+}
+
+function Test-JournalFile {
+    param([string]$Path)
+    $rd = New-Object System.IO.StreamReader($Path, (Get-Enc), $true)
+    try {
+        for ($cc = 0; $cc -lt 10; $cc++) {
+            $ln2 = $rd.ReadLine()
+            if ($null -eq $ln2) { break }
+            if ($ln2.Length -eq 0) { continue }
+            $ff2 = Split-CsvLine $ln2
+            $hd3 = [string[]]@($ff2 | ForEach-Object { $_.Trim().ToLowerInvariant() })
+            if ((Find-Col $hd3 '^usn$') -ge 0 -and (Find-Col $hd3 'reason|motiv|caus') -ge 0) { return $true }
+        }
+        return $false
+    }
+    finally { $rd.Dispose() }
+}
+
+function Get-FirstStamp {
+    param([string]$Drv, [long]$Usn)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'fsutil'
+    $psi.Arguments = ('usn readjournal {0} startusn={1} csv' -f $Drv, $Usn)
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+    try { $psi.StandardOutputEncoding = (Get-Enc) } catch { }
+    $pr = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $iT2 = -1
+        $cnt = 0
+        while ($cnt -lt 12 -and $null -ne ($pl = $pr.StandardOutput.ReadLine())) {
+            $cnt++
+            if ($pl.Length -eq 0) { continue }
+            $ff = Split-CsvLine $pl
+            if ($iT2 -lt 0) {
+                $hd2 = [string[]]@($ff | ForEach-Object { $_.Trim().ToLowerInvariant() })
+                $cu2 = Find-Col $hd2 '^usn$'
+                $cr2 = Find-Col $hd2 'reason|motiv|caus'
+                if ($cu2 -ge 0 -and $cr2 -ge 0) {
+                    $iT2 = Find-Col $hd2 'time ?stamp|marca temporale|^data'
+                    if ($iT2 -lt 0) { return $null }
+                }
+                continue
+            }
+            if ($ff.Length -gt $iT2) {
+                $dtq = [datetime]::MinValue
+                if ([datetime]::TryParse($ff[$iT2].Trim(), [ref]$dtq)) { return $dtq }
+            }
+            return $null
+        }
+        return $null
+    }
+    finally {
+        try { if (-not $pr.HasExited) { $pr.Kill() } } catch { }
+        $pr.Dispose()
+    }
+}
+
+function Find-StartUsn {
+    param([string]$Drv, [datetime]$Since)
+    $qraw = @(& fsutil usn queryjournal $Drv 2>&1)
+    $vals = New-Object System.Collections.Generic.List[long]
+    foreach ($qline in $qraw) {
+        $qm = [regex]::Match([string]$qline, '0x([0-9A-Fa-f]{1,16})')
+        if ($qm.Success) {
+            try { $vals.Add([Convert]::ToInt64($qm.Groups[1].Value, 16)) } catch { $vals.Add(-1L) }
+        }
+    }
+    if ($vals.Count -lt 3) { return $null }
+    $first = $vals[1]
+    $next = $vals[2]
+    if ($first -lt 0 -or $next -le $first) { return $null }
+    $lo = $first
+    $hi = $next
+    $probes = 0
+    $okCount = 0
+    $failCount = 0
+    while (($hi - $lo) -gt 4MB -and $probes -lt 40) {
+        $mid = $lo + [long][Math]::Floor(($hi - $lo) / 2)
+        $stamp = Get-FirstStamp $Drv $mid
+        $probes++
+        if ($null -eq $stamp) {
+            $failCount++
+            if ($okCount -eq 0 -and $failCount -ge 2) { return $null }
+            $hi = $mid
+        }
+        else {
+            $okCount++
+            if ($stamp -lt $Since) { $lo = $mid } else { $hi = $mid }
+        }
+    }
+    $start = [Math]::Max($first, $lo - 2MB)
+    return [pscustomobject]@{ Start = $start; First = $first; Next = $next; Probes = $probes }
+}
+
 $tempToDelete = $null
 $expected = $null
+$skipInfo = ''
 
 if ($SelfTest) {
     $syn = @(
@@ -436,8 +541,30 @@ if ($SelfTest) {
 elseif (-not $InputFile) {
     Write-Host ("Lettura del journal USN di {0} ..." -f $Drive) -ForegroundColor Cyan
     $tempToDelete = [IO.Path]::GetTempFileName()
-    cmd /c ('fsutil usn readjournal {0} csv > "{1}"' -f $Drive, $tempToDelete)
-    if ($LASTEXITCODE -ne 0 -or (Get-Item $tempToDelete).Length -eq 0) {
+    $startUsn = $null
+    if ($null -ne $since -and -not $LetturaCompleta) {
+        Write-Host 'Cerco il punto di partenza nel journal ...' -ForegroundColor Cyan
+        $found = $null
+        try { $found = Find-StartUsn $Drive $since } catch { $found = $null }
+        if ($null -eq $found) { $skipInfo = 'ricerca del punto di partenza non riuscita: letto tutto il journal' }
+        elseif ($found.Start -le $found.First) { $skipInfo = "il journal parte gia' dopo l'orario: letto tutto" }
+        else {
+            $startUsn = $found.Start
+            $pct = [Math]::Round(100.0 * ($found.Start - $found.First) / ($found.Next - $found.First))
+            $skipInfo = ('lettura dal USN {0} (saltato circa il {1}% del journal, {2} tentativi)' -f $found.Start, $pct, $found.Probes)
+        }
+    }
+    if ($null -ne $startUsn) { $fsCmd = ('fsutil usn readjournal {0} startusn={1} csv > "{2}"' -f $Drive, $startUsn, $tempToDelete) }
+    else { $fsCmd = ('fsutil usn readjournal {0} csv > "{1}"' -f $Drive, $tempToDelete) }
+    cmd /c $fsCmd
+    $okRead = ($LASTEXITCODE -eq 0 -and (Get-Item $tempToDelete).Length -gt 0 -and (Test-JournalFile $tempToDelete))
+    if (-not $okRead -and $null -ne $startUsn) {
+        Write-Host 'Lettura parziale non riuscita: rileggo tutto il journal.' -ForegroundColor Yellow
+        $skipInfo = 'lettura parziale non riuscita: letto tutto il journal'
+        cmd /c ('fsutil usn readjournal {0} csv > "{1}"' -f $Drive, $tempToDelete)
+        $okRead = ($LASTEXITCODE -eq 0 -and (Get-Item $tempToDelete).Length -gt 0)
+    }
+    if (-not $okRead) {
         Remove-Item $tempToDelete -ErrorAction SilentlyContinue
         throw "fsutil non ha restituito dati (serve una console avviata come Amministratore, e il journal deve esistere su $Drive)."
     }
@@ -447,9 +574,7 @@ elseif (-not (Test-Path -LiteralPath $InputFile)) {
     throw "File non trovato: $InputFile"
 }
 
-$enc = if ($Encoding -eq 'OEM') {
-    [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
-} else { New-Object System.Text.UTF8Encoding($false) }
+$enc = Get-Enc
 
 $swRead = [Diagnostics.Stopwatch]::StartNew()
 $usnL = New-Object System.Collections.Generic.List[long]
@@ -747,6 +872,7 @@ if ($null -ne $since) {
     if ($sinceLabel -eq 'ultimo avvio del PC') { Write-Host "Se il PC usa l'Avvio rapido, l'orario puo' risalire a un avvio precedente: in quel caso usa -Dopo 'AAAA-MM-GG HH:mm'." -ForegroundColor Yellow }
 }
 elseif ($sinceNote) { Write-Host ("Filtro data            : {0}" -f $sinceNote) }
+if ($skipInfo) { Write-Host ("Lettura journal        : {0}" -f $skipInfo) -ForegroundColor Cyan }
 if ($unknownText -gt 0) { Write-Host ("Descrizioni non riconosciute: {0:N0}" -f $unknownText) -ForegroundColor Yellow }
 if (-not $hasAttr) { Write-Host 'Colonna attributi non trovata: disattivati Sola lettura (+/-), Icacls e i filtri sugli attributi (usa -AttrCol).' -ForegroundColor Yellow }
 Write-Host ("CSV principale         : {0:N0} rilevamenti  (flag {1:N0}, prioritari {2:N0}, altri {3:N0})" -f $sumMain, $cntMain[0], $cntMain[1], $cntMain[2])
