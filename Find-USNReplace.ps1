@@ -16,12 +16,24 @@ param(
     [int]$AttrCol = -1,
     [string[]]$PriorityExt = @('.exe', '.dll', '.jar', '.py'),
     [string[]]$DeleteExt = @('.exe', '.dll', '.jar', '.ini', '.py'),
-    [string[]]$Keywords = @('remote', 'clicker', 'injection', 'bypass', 'macro', 'totem', 'destruct', 'bridge'),
+    [string[]]$CreateExt = @('.class'),
+    [string[]]$RiskExt = @('.exe', '.dll', '.sys', '.drv', '.scr', '.ocx', '.cpl', '.com', '.msi', '.ps1', '.bat', '.cmd', '.vbs', '.js', '.hta', '.lnk', '.jar', '.class', '.py'),
+    [string[]]$Keywords = @(
+        'remote', 'clicker', 'injection', 'bypass', 'macro', 'totem', 'destruct', 'bridge',
+        'wurst', 'meteor', 'liquidbounce', 'aristois', 'future', 'inertia', 'raven', 'boze', 'sigma',
+        'bleachhack', 'phobos', 'doomsday', 'vape',
+        'nursultan', 'wild', 'catlean', 'celestial', 'cproject', 'akrien', 'arbuz', 'deadcode', 'delta',
+        'excellent', 'eternity', 'expensive', 'melonity', 'minced', 'relake', 'rockstar', 'thunderhack',
+        'troxill', 'venus', 'verist', 'projectwing', 'wexside', 'zamorozka',
+        'rogalik', 'quickclient', 'quick client', 'manloxx', 'redust', 'aours', 'arcana',
+        'waveclient', 'wave client', 'onionlauncher', 'onion launcher', 'rasty'
+    ),
     [string[]]$WatchNames = @('jnativehook'),
     [string]$Dopo,
     [switch]$TuttoIlJournal,
     [switch]$LetturaCompleta,
     [switch]$Tollerante,
+    [switch]$PfStrict,
     [switch]$SelfTest
 )
 
@@ -149,11 +161,17 @@ $NB_PF = 2
 $NB_DEL = 4
 $NB_KEY = 8
 $NB_WATCH = 16
+$NB_NEW = 32
+$NB_RISK = 64
 
 $priSet = @{}
 foreach ($e in $PriorityExt) { $priSet[(Convert-Ext $e)] = $true }
 $delSet = @{}
 foreach ($e in $DeleteExt) { $delSet[(Convert-Ext $e)] = $true }
+$createSet = @{}
+foreach ($e in $CreateExt) { $createSet[(Convert-Ext $e)] = $true }
+$riskSet = @{}
+foreach ($e in $RiskExt) { $riskSet[(Convert-Ext $e)] = $true }
 $kw = @($Keywords | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_.Length -gt 0 })
 $wn = @($WatchNames | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_.Length -gt 0 })
 
@@ -206,18 +224,36 @@ $RuleDefs = [ordered]@{
     'HEX 2'            = @{ Kind = 'Seq'; Steps = @(
             (St 'DataOverwrite', 'DataExtend'),
             (St 'DataOverwrite', 'DataExtend', 'Close')) }
+    'PF svuotato'      = @{ Kind = 'Seq'; Steps = @(
+            (St -Names 'DataTruncation' -Mode 'Contains' -NameReq $NB_PF),
+            (St -Names 'DataTruncation', 'Close' -Mode 'Contains' -NameReq $NB_PF)) }
+    'Cambio estensione' = @{ Kind = 'Seq'; Check = 'ExtChange'; Steps = @(
+            (St 'RenameOldName'),
+            (St 'RenameNewName')) }
     'Eliminazione'     = @{ Kind = 'Flag'; Steps = @(
             (St -Names 'FileDelete' -Mode 'Contains' -NameReq ($NB_DEL -bor $NB_WATCH))) }
     'Rinomina keyword' = @{ Kind = 'Flag'; Steps = @(
             (St -AnyOf 'RenameOldName', 'RenameNewName' -Mode 'Contains' -NameReq $NB_KEY)) }
+    'Rinomina estensione' = @{ Kind = 'Flag'; Steps = @(
+            (St -Names 'RenameNewName' -Mode 'Contains' -NameReq $NB_RISK)) }
+    'Creazione estensione' = @{ Kind = 'Flag'; Steps = @(
+            (St -Names 'FileCreate' -Mode 'Contains' -NameReq $NB_NEW)) }
+    'Creazione keyword' = @{ Kind = 'Flag'; Steps = @(
+            (St -Names 'FileCreate' -Mode 'Contains' -NameReq $NB_KEY)) }
     'PF sovrascritto'  = @{ Kind = 'Flag'; Steps = @(
             (St -Names 'DataOverwrite' -Mode 'Contains' -NameReq $NB_PF)) }
+    'PF eliminato'     = @{ Kind = 'Flag'; Steps = @(
+            (St -Names 'FileDelete', 'Close' -Mode 'Contains' -NameReq $NB_PF)) }
+    'Sovrascrittura eseguibile' = @{ Kind = 'Flag'; Steps = @(
+            (St -Names 'DataOverwrite' -Mode 'Contains' -NameReq $NB_RISK)) }
     'Sola lettura (+)' = @{ Kind = 'Flag'; Steps = @(
             (St -Names 'BasicInfoChange' -Mode 'Exact' -Attrs @(0x21L, 0x2021L) -NameReq $NB_PF)) }
     'Sola lettura (-)' = @{ Kind = 'Flag'; Steps = @(
             (St -Names 'BasicInfoChange' -Mode 'Exact' -Attrs @(0x2020L))) }
     'Icacls'           = @{ Kind = 'Flag'; Steps = @(
             (St -Names 'SecurityChange' -Mode 'Exact' -Attrs @(0x2010L))) }
+    'Crittografia EFS' = @{ Kind = 'Flag'; Steps = @(
+            (St -Names 'EncryptionChange' -Mode 'Contains')) }
 }
 
 $ruleObjs = New-Object System.Collections.Generic.List[object]
@@ -232,7 +268,7 @@ foreach ($rname in $RuleDefs.Keys) {
     $steps = [object[]]@($def.Steps)
     $masks = New-Object 'long[]' $steps.Length
     for ($j = 0; $j -lt $steps.Length; $j++) { $masks[$j] = [long]$steps[$j].Mask }
-    $ro = [pscustomobject]@{ Index = $ri; Name = $rname; Kind = $def.Kind; Steps = $steps; Masks = $masks; Len = $steps.Length }
+    $ro = [pscustomobject]@{ Index = $ri; Name = $rname; Kind = $def.Kind; Steps = $steps; Masks = $masks; Len = $steps.Length; Check = $def.Check }
     $ruleObjs.Add($ro)
     $perRule[$rname] = 0
     $perNear[$rname] = 0
@@ -277,6 +313,8 @@ function Get-NameBits {
         $ext = $base.Substring($dot)
         if ($priSet.ContainsKey($ext)) { $bits = $bits -bor $NB_PRI }
         if ((-not $isPfName) -and $delSet.ContainsKey($ext)) { $bits = $bits -bor $NB_DEL }
+        if ((-not $isPfName) -and $createSet.ContainsKey($ext)) { $bits = $bits -bor $NB_NEW }
+        if ((-not $isPfName) -and $riskSet.ContainsKey($ext)) { $bits = $bits -bor $NB_RISK }
     }
     foreach ($w in $kw) { if ($ln.Contains($w)) { $bits = $bits -bor $NB_KEY; break } }
     foreach ($w in $wn) { if ($ln.Contains($w)) { $bits = $bits -bor $NB_WATCH; break } }
@@ -300,6 +338,29 @@ function Test-Step {
     return $true
 }
 
+function Get-ExtName {
+    param([string]$FileName)
+    $ln = $FileName.Trim().ToLowerInvariant()
+    $dot = $ln.LastIndexOf('.')
+    if ($dot -lt 0) { return '' }
+    return $ln.Substring($dot)
+}
+
+function Test-ExtChange {
+    param([int]$Start, [int]$Len)
+    $last = $Start + $Len - 1
+    $oldExt = Get-ExtName $NM[$Start]
+    $newExt = Get-ExtName $NM[$last]
+    if ($oldExt.Length -eq 0 -or $newExt.Length -eq 0) { return $false }
+    if ($oldExt -eq $newExt) { return $false }
+    $b1 = $nb[$Start]
+    if ($b1 -eq 0) { $b1 = (Get-NameBits $NM[$Start]) -bor 256; $nb[$Start] = $b1 }
+    $b2 = $nb[$last]
+    if ($b2 -eq 0) { $b2 = (Get-NameBits $NM[$last]) -bor 256; $nb[$last] = $b2 }
+    if ((($b1 -bor $b2) -band $NB_RISK) -eq 0) { return $false }
+    return $true
+}
+
 function Get-Detail {
     param([string]$Rule, [string]$FileName, [long]$Reason)
     $ln = $FileName.ToLowerInvariant()
@@ -315,6 +376,26 @@ function Get-Detail {
         $dot = $ln.LastIndexOf('.')
         if ($dot -ge 0) { return ('estensione: ' + $ln.Substring($dot)) }
     }
+    if ($Rule -eq 'Creazione estensione') {
+        $dot = $ln.LastIndexOf('.')
+        if ($dot -ge 0) { return ('estensione: ' + $ln.Substring($dot)) }
+    }
+    if ($Rule -eq 'Creazione keyword') {
+        foreach ($w in $kw) { if ($ln.Contains($w)) { return ('nome: ' + $w) } }
+    }
+    if ($Rule -eq 'Rinomina estensione') {
+        $dot = $ln.LastIndexOf('.')
+        $txt = ''
+        if ($dot -ge 0) { $txt = 'estensione: ' + $ln.Substring($dot) }
+        foreach ($w in $kw) { if ($ln.Contains($w)) { if ($txt) { $txt = $txt + ' | ' }; $txt = $txt + 'nome: ' + $w; break } }
+        return $txt
+    }
+    if ($Rule -eq 'Sovrascrittura eseguibile') {
+        $dot = $ln.LastIndexOf('.')
+        if ($dot -ge 0) { return ('estensione: ' + $ln.Substring($dot)) }
+    }
+    if ($Rule -eq 'Crittografia EFS') { return 'file crittografato' }
+    if ($Rule -eq 'PF eliminato') { return 'prefetch eliminato' }
     return ''
 }
 
@@ -521,7 +602,25 @@ if ($SelfTest) {
         @(0x00008000L, 'X.EXE-1A2B3C4D.pf', 0x21L),
         @(0x00008000L, 'plain.txt', 0x2020L),
         @(0x00000800L, 'somedir', 0x2010L),
-        @(0x00008000L, 'plain2.txt', 0x21L)
+        @(0x00008000L, 'plain2.txt', 0x21L),
+        @(0x80000200L, 'OLD.EXE-1A2B3C4D.pf'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00000004L, 'TMP.EXE-1A2B3C4D.pf'),
+        @(0x80000004L, 'TMP.EXE-1A2B3C4D.pf'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00000100L, 'Payload.class'),
+        @(0x80000100L, 'Other.class'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00000100L, 'notjava.txt'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00000100L, 'WurstClient.jar'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00001000L, 'setup.exe'),
+        @(0x00002000L, 'setup.sys'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00000001L, 'core.dll'),
+        @(0x00000100L, 'sep.txt'),
+        @(0x00040000L, 'secret.docx')
     )
     $tempToDelete = [IO.Path]::GetTempFileName()
     $lines = New-Object System.Collections.Generic.List[string]
@@ -537,8 +636,11 @@ if ($SelfTest) {
     $MatchMode = 'Exact'
     $expected = [ordered]@{
         'Replace' = 1; 'Type 1' = 1; 'Type 2' = 1; 'Copy 1' = 0; 'Copy 2' = 0; 'HEX 1' = 1; 'HEX 2' = 1
-        'Eliminazione' = 2; 'Rinomina keyword' = 2; 'PF sovrascritto' = 1
-        'Sola lettura (+)' = 1; 'Sola lettura (-)' = 1; 'Icacls' = 1
+        'PF svuotato' = 1; 'Cambio estensione' = 2
+        'Eliminazione' = 2; 'Rinomina keyword' = 2; 'Rinomina estensione' = 1
+        'Creazione estensione' = 2; 'Creazione keyword' = 1
+        'PF sovrascritto' = 1; 'PF eliminato' = 1; 'Sovrascrittura eseguibile' = 1
+        'Sola lettura (+)' = 1; 'Sola lettura (-)' = 1; 'Icacls' = 1; 'Crittografia EFS' = 1
     }
     Write-Host 'Modalita'' SelfTest: uso record sintetici.' -ForegroundColor Cyan
 }
@@ -726,6 +828,7 @@ for ($i = 0; $i -lt $n; $i++) {
             for ($k = 0; $k -lt $len; $k++) {
                 if (-not (Test-Step ($i + $k) $steps[$k])) { $ok = $false; break }
             }
+            if ($ok -and $rule.Check) { $ok = (Test-ExtChange $i $len) }
             if ($ok) {
                 $mRule.Add($rule.Index); $mStart.Add($i); $mConf.Add(0)
                 if ($Tollerante) { [void]$exactStarts[$rule.Index].Add($i) }
@@ -747,6 +850,7 @@ if ($Tollerante -and $MatchMode -eq 'Exact') {
             for ($k = 1; $k -lt $len; $k++) {
                 if (($R[$i + $k] -band $masks[$k]) -ne $masks[$k]) { $ok = $false; break }
             }
+            if ($ok -and $rule.Check) { $ok = (Test-ExtChange $i $len) }
             if (-not $ok) { continue }
             if ($exactStarts[$rule.Index].Contains($i)) { continue }
             $mRule.Add($rule.Index); $mStart.Add($i); $mConf.Add(1)
@@ -789,7 +893,10 @@ try {
             if ($bb -eq 0) { $bb = (Get-NameBits $NM[$idx]) -bor 256; $nb[$idx] = $bb }
             $bAll = $bAll -bor $bb
         }
-        $isPf = (($bAll -band $NB_PF) -ne 0)
+        $b0 = $nb[$i]
+        if ($b0 -eq 0) { $b0 = (Get-NameBits $NM[$i]) -bor 256; $nb[$i] = $b0 }
+        if ($PfStrict) { $isPf = (($b0 -band $NB_PF) -ne 0) }
+        else { $isPf = (($bAll -band $NB_PF) -ne 0) }
         if ($rule.Kind -eq 'Flag') { $rank = 0 }
         elseif (($bAll -band $NB_PRI) -ne 0) { $rank = 1 }
         else { $rank = 2 }
@@ -877,6 +984,7 @@ if ($null -ne $since) {
 }
 elseif ($sinceNote) { Write-Host ("Filtro data            : {0}" -f $sinceNote) }
 if ($skipInfo) { Write-Host ("Lettura journal        : {0}" -f $skipInfo) -ForegroundColor Cyan }
+if ($PfStrict) { Write-Host 'Routing .pf            : solo rilevamenti che iniziano su un file .pf' -ForegroundColor Cyan }
 if ($unknownText -gt 0) { Write-Host ("Descrizioni non riconosciute: {0:N0}" -f $unknownText) -ForegroundColor Yellow }
 if (-not $hasAttr) { Write-Host 'Colonna attributi non trovata: disattivati Sola lettura (+/-), Icacls e i filtri sugli attributi (usa -AttrCol).' -ForegroundColor Yellow }
 Write-Host ("CSV principale         : {0:N0} rilevamenti  (flag {1:N0}, prioritari {2:N0}, altri {3:N0})" -f $sumMain, $cntMain[0], $cntMain[1], $cntMain[2])
@@ -914,8 +1022,9 @@ if ($SelfTest) {
         $tag = if ($got -eq $expected[$k]) { 'OK  ' } else { $fail = $true; 'FAIL' }
         Write-Host ("[{0}] {1}: atteso {2}, ottenuto {3}" -f $tag, $k, $expected[$k], $got)
     }
-    $expMain = @(6, 1, 3)
-    $expPf = @(2, 1, 0)
+    $expMain = @(12, 3, 3)
+    $expPf = @(3, 2, 0)
+    if ($PfStrict) { $expMain = @(12, 4, 3); $expPf = @(3, 1, 0) }
     for ($r2 = 0; $r2 -lt 3; $r2++) {
         $tag = if ($cntMain[$r2] -eq $expMain[$r2]) { 'OK  ' } else { $fail = $true; 'FAIL' }
         Write-Host ("[{0}] CSV principale categoria {1}: atteso {2}, ottenuto {3}" -f $tag, $prLabels[$r2], $expMain[$r2], $cntMain[$r2])
